@@ -1,7 +1,7 @@
 # MediGuide AI 🏥🩺
 > **"Understand Your Health, Make Informed Decisions."**
 
-MediGuide AI is a full-stack, hackathon-ready healthcare information web application designed to help users understand complex medical laboratory reports and general health concepts through simple, transparent explanations in **English** and **Telugu (తెలుగు)**.
+MediGuide AI is a full-stack healthcare information web application designed to help users understand medical laboratory reports and general health concepts through clear explanations in **English**, **Telugu (తెలుగు)**, and **Hindi (हिन्दी)**.
 
 ---
 
@@ -26,12 +26,12 @@ MediGuide AI **does not** diagnose diseases, prescribe medication or dosages, re
    - Extracted text preview drawer with copy capability.
    - **Image-Only / Scanned PDF Detection**: Clear alerts when a PDF lacks a digital text layer, preventing fabricated data.
    - **Structured Biomarkers Table**: Extracted test names, observed values, standard units, reference ranges, and status badges (`NORMAL`, `HIGH`, `LOW`, `BORDERLINE`).
-   - **Bilingual AI Explanations**: Plain-language breakdown of every biomarker in English and Telugu.
+   - **Multilingual AI Explanations**: Gemini-generated plain-language explanations include English, Telugu, and Hindi fields.
    - AI educational summary with key takeaways and actionable questions for your doctor.
 
 3. **AI Health Assistant**
-   - Clean, interactive bilingual chat interface.
-   - Instant language switching between English and Telugu.
+   - Clean, interactive multilingual chat interface.
+   - Instant language switching between English, Telugu, and Hindi.
    - Context-aware explanations of medical terminology, tests, and healthy lifestyle habits.
    - Suggested follow-up prompt chips.
    - Supporting trusted public health references displayed alongside responses.
@@ -50,9 +50,14 @@ MediGuide AI **does not** diagnose diseases, prescribe medication or dosages, re
 
 6. **Privacy, Ethics & Settings**
    - Real-time backend health check and live ping button.
-   - Gemini API status indicator (Live Gemini 2.5 vs High-Fidelity Demo Mode).
+   - Backend AI provider status and protected operational metrics.
    - Language preference persistence (`localStorage`).
-   - Uploaded reports and extracted report contents are processed in memory and are not persisted by this app. Account profile data, salted password hashes, and hashed session/reset tokens are stored in a local SQLite database.
+   - Uploaded PDF files and extracted raw text are processed in memory and are never retained. Signed-in users can save analysis summaries/results and chat conversations to private account history and delete individual entries.
+7. **Health Tips, Emergency & Account**
+   - Health Tips are general educational content in English, Telugu, and Hindi.
+   - Emergency search uses Google Places for provider-supplied hospital details and requires a backend-only `GOOGLE_MAPS_API_KEY`; the app does not dispatch emergency services.
+   - Account profile edits are authenticated and stored in the user's profile.
+   - Light/dark theme and language preferences persist locally.
 
 ---
 
@@ -62,7 +67,7 @@ MediGuide AI **does not** diagnose diseases, prescribe medication or dosages, re
 |---|---|
 | **Frontend** | React 19, TypeScript, Vite, Tailwind CSS v4, Lucide React, Recharts |
 | **Backend** | Python 3.10+, FastAPI, Uvicorn, Pydantic, python-multipart |
-| **AI / NLP** | Google Gemini API via official `google-genai` SDK (`gemini-2.5-flash` / `gemini-2.0-flash`) |
+| **AI / NLP** | Gemini via official `google-genai` SDK, with OpenAI via the official `openai` SDK as the optional secondary provider |
 | **PDF Extraction** | `pypdf` (in-memory stream parsing) |
 | **Environment** | `python-dotenv` |
 
@@ -73,7 +78,8 @@ MediGuide AI **does not** diagnose diseases, prescribe medication or dosages, re
 ```
 MediGuide-Project/
 ├── backend/
-│   ├── main.py                  # FastAPI server, endpoints, Gemini integration & safety logic
+│   ├── main.py                  # FastAPI server and API endpoints
+│   ├── ai_service.py            # Provider routing, fallback, caching, limits & metrics
 │   ├── demo_data.py             # Realistic fictional clinical datasets & bilingual demo content
 │   ├── generate_sample_pdfs.py  # Generates test medical PDF documents
 │   ├── test_api.py              # Automated backend API and PDF extraction test suite
@@ -89,8 +95,12 @@ MediGuide-Project/
 │   │   ├── pages/
 │   │   │   ├── DashboardPage.tsx         # Welcome hero, quick actions & sample showcase
 │   │   │   ├── ReportAnalyzerPage.tsx    # PDF upload, extraction, lab table & AI summaries
-│   │   │   ├── ChatAssistantPage.tsx     # Bilingual chat assistant with prompt chips
+│   │   │   ├── ChatAssistantPage.tsx     # Multilingual chat assistant with prompt chips
 │   │   │   ├── ReportComparisonPage.tsx  # Longitudinal report trend analysis & Recharts
+│   │   │   ├── HealthTipsPage.tsx         # Multilingual educational health guidance
+│   │   │   ├── EmergencyPage.tsx          # Confirmed emergency calling & Places lookup
+│   │   │   ├── HistoryPage.tsx            # Per-account report and chat history
+│   │   │   ├── AccountPage.tsx            # Authenticated account profile editing
 │   │   │   ├── SourcesPage.tsx           # Trusted medical references with search & filters
 │   │   │   └── SettingsPage.tsx          # Privacy policy, API status & language settings
 │   │   ├── services/
@@ -140,20 +150,26 @@ MediGuide-Project/
    pip install -r backend/requirements.txt
    ```
 
-4. Configure Gemini API Key:
+4. Configure AI providers:
    - Copy `backend/.env.example` to `backend/.env`
-   - Add your Gemini API key from [Google AI Studio](https://aistudio.google.com/):
+   - Add your Gemini API key from [Google AI Studio](https://aistudio.google.com/) and select a model available to that project:
      ```ini
      GEMINI_API_KEY=your_actual_gemini_api_key_here
+     GEMINI_MODEL=gemini-3.6-flash
      ```
-   *Note: If no key is provided, MediGuide AI automatically operates in **High-Fidelity Demo Mode** with complete fictional lab reports and bilingual responses.*
+   - Optional fallback: configure `OPENAI_API_KEY` and `OPENAI_MODEL` in `backend/.env`. Gemini remains primary; OpenAI is called automatically after a retryable Gemini outage or quota/rate-limit response. Leave them blank to disable fallback. Keys belong only in `backend/.env`; never add them to frontend settings or source control.
+   - Optional operational controls are listed in `.env.example`: request rate limit, bounded rate-limit retries, general-question cache TTL, provider timeouts, an admin-only metrics token, and provider token prices for estimates.
+   *AI chat does not return demo answers. If no configured provider can answer, it returns a user-safe temporary-unavailable message. Provider quotas and billing remain subject to each provider's plan and limits.*
 
 5. Configure authentication services as needed:
-   - **Email/password accounts** work without external credentials. Doctor signup requires a server-only `DOCTOR_SIGNUP_CODE`; issue it only after independently verifying the physician and their license. The app does not query a licensing registry.
+   - **Email/password accounts** work without external credentials. Registration uses one common account flow; clinician accounts remain administrator-provisioned with the server-only `DOCTOR_SIGNUP_CODE` after license verification. The app does not query a licensing registry.
    - **Password recovery** requires `SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM_EMAIL`. Set `SMTP_USER` and `SMTP_PASSWORD` together if the mail server requires authentication. Reset links expire after 30 minutes. Missing or failed SMTP results in an explicit error; reset tokens are never returned by the API.
-   - **Google sign-in** requires a Google OAuth web client ID and secret. Register the exact `GOOGLE_REDIRECT_URI` in the provider console.
-   - **Apple sign-in** requires a Sign in with Apple Service ID, Team ID, Key ID, private key, and publicly reachable HTTPS `APPLE_REDIRECT_URI` registered to the Services ID. For local development, use an HTTPS tunnel and register that exact callback URL; plain HTTP localhost callbacks are rejected.
-   - Set `FRONTEND_URL` to the browser-visible frontend origin used for reset links and the Apple handoff. Provider secrets and signing keys must remain in `backend/.env`.
+   - **Google sign-in** uses Google's authorization-code flow and requires a Google OAuth web client ID and secret in `backend/.env`. Add the exact value of `GOOGLE_REDIRECT_URI` as an authorized redirect URI in Google Cloud; by default it is `http://localhost:5173/`. Use that same frontend host in the browser so OAuth state is preserved. The app requests account selection and the `openid email profile` scopes, then verifies Google's ID token on the backend.
+   - **Apple sign-in** is currently a disabled UI placeholder and does not start authentication.
+   - **Nearby hospitals** require a Google Maps Platform Places API key in `GOOGLE_MAPS_API_KEY` on the backend. Enable the Places API for the key and restrict it to the backend/server where possible; never put the key in frontend code.
+   - Set `FRONTEND_URL` to the browser-visible frontend origin used for password-reset links. Provider secrets and signing keys must remain in `backend/.env`.
+   - The AI Health Assistant sends each question and up to 12 preceding conversation messages to the centralized backend AI service. Gemini is primary; a configured OpenAI account is used automatically after primary-provider failure. Only short, general, context-free educational questions are eligible for a process-local cache.
+   - `GET /api/ai/status` reports safe provider availability. `GET /api/ai/metrics` requires `Authorization: Bearer <AI_METRICS_TOKEN>` and reports in-memory request, error, switch, latency, cache, token, and optional cost-estimate totals. Metrics, cache, rate limits, and cooldowns are process-local; use shared infrastructure for multi-worker or multi-instance deployments.
 
 6. Start the FastAPI backend server from the project root:
    ```bash
@@ -211,7 +227,7 @@ PASS: Health OK. Gemini configured: False, Model: Demo Fallback Mode
 1. **Upload Actual Medical PDFs**:
    - Navigate to **Report Analyzer**.
    - Drag & drop `sample_reports/Sample_CBC_Lab_Report.pdf` or `sample_reports/Sample_Lipid_Panel_Report.pdf`.
-   - Watch the upload progress bar, verify extracted text preview, view structured lab values, and read English and Telugu summaries.
+   - Watch the upload progress bar, verify extracted text preview, view structured lab values, and read available English, Telugu, and Hindi explanations.
 
 2. **Test Scanned Image Detection**:
    - Drag & drop `sample_reports/Sample_Scanned_Document.pdf`.
@@ -233,19 +249,26 @@ PASS: Health OK. Gemini configured: False, Model: Demo Fallback Mode
 
 6. **Longitudinal Comparison**:
    - Navigate to **Report Comparison**.
-   - Switch between Lipid Profile, CBC, and Fasting Glucose trends.
-   - Inspect the interactive Recharts bar charts and calculated deltas.
+   - Signed-in users can compare compatible numeric results from two saved uploaded reports; sample/demo data remains available to guests.
+   - Only tests with matching names and units are compared. Review changes with a qualified healthcare professional.
+
+7. **History & Account**:
+   - Analyze an uploaded report or ask the assistant while signed in, then review/delete saved records in **History**.
+   - Source PDFs and extracted raw report text are not saved.
+   - Manage your display name and profile picture under **My Account**.
 
 ---
 
 ## 🔒 Security & Privacy Architecture
 
-- **No Persistent PDF Storage**: Uploaded files are parsed via `io.BytesIO` in memory and discarded upon response delivery.
+- **No Persistent PDF or raw-text Storage**: Uploaded files and extracted source text are parsed in memory and discarded. For signed-in users, the database stores report summaries/results (which may contain health information) and chat question/reply history until the user deletes them. Keep the local SQLite database protected.
 - **AI report processing**: When a Gemini API key is configured, extracted report text is sent to Google's Gemini API for analysis and is subject to Google's data-handling terms. Demo mode does not send report text to Gemini.
 - **Persistent authentication store**: Account profile fields and salted PBKDF2 password hashes are stored in `backend/mediguide.sqlite3` by default. Opaque sessions and password reset tokens are stored as hashes with expiration; password reset and sign-out revoke sessions.
+- **User history**: Report analysis summaries/test results and assistant conversation text are stored per authenticated account. History endpoints enforce ownership and support deletion. Uploaded PDFs, extracted raw text, and patient profile fields from analyzed reports are not included in report-history persistence.
 - **Role verification**: Doctor privileges are assigned only when the server validates its administrator-issued authorization code. An administrator must verify physician credentials before issuing that code.
 - **Password recovery**: Single-use reset tokens expire after 30 minutes and are delivered through configured SMTP. Tokens are never returned in API responses, and the response does not disclose whether an account exists.
 - **Strict Server-Side Key Isolation**: `GEMINI_API_KEY` is loaded exclusively into backend memory. No API keys are bundled into frontend assets or client storage.
+- **Google Places key isolation**: `GOOGLE_MAPS_API_KEY` is used only by the backend to search for nearby hospitals and is never returned to the browser.
 - **Safe Prompting**: Conservative system instructions restrict the model to educational summaries and actively block diagnostic or prescriptive statements.
 
 ---

@@ -287,19 +287,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
           <div className="flex items-start gap-2.5">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
             <p>
-              <strong>Account Data:</strong> Account names, email addresses, roles, salted password hashes, and hashed session credentials are stored in the configured SQLite database. Passwords and raw session tokens are not stored.
+              <strong>Account Data:</strong> Account profile fields and salted password hashes are stored in SQLite. Passwords and raw session tokens are not stored.
             </p>
           </div>
           <div className="flex items-start gap-2.5">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
             <p>
-              <strong>No Patient Tracking:</strong> MediGuide AI does not log account identifiers or medical-record contents.
+              <strong>Private Account History:</strong> Report summaries/results and AI chat conversations are stored under your account until deleted in History. The account identifier is used to enforce ownership.
             </p>
           </div>
           <div className="flex items-start gap-2.5">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
             <p>
-              <strong>Client Session Isolation:</strong> Chat conversations are kept solely within the active browser session and can be cleared instantly at any moment.
+              <strong>No Source PDF Retention:</strong> Uploaded PDF files, extracted raw report text, and patient profile fields from analyzed reports are not stored by report history.
             </p>
           </div>
         </div>

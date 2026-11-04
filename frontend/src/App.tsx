@@ -9,6 +9,10 @@ import { ReportComparisonPage } from './pages/ReportComparisonPage';
 import { SourcesPage } from './pages/SourcesPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { LoginPage } from './pages/LoginPage';
+import { HealthTipsPage } from './pages/HealthTipsPage';
+import { EmergencyPage } from './pages/EmergencyPage';
+import { AccountPage } from './pages/AccountPage';
+import { HistoryPage } from './pages/HistoryPage';
 import { HealthStatus, Language, NavigationTab, UserProfile } from './types';
 import { ApiRequestError, fetchCurrentUser, fetchHealth, logoutApi } from './services/api';
 import { HeartHandshake, ShieldCheck } from 'lucide-react';
@@ -24,13 +28,19 @@ export function App() {
 
   const [activeTab, setActiveTab] = useState<NavigationTab>(() => {
     const guestFlag = sessionStorage.getItem('mediguide_guest');
+    if (typeof window !== 'undefined' && (window.location.hash === '#dashboard' || window.location.search.includes('tab=dashboard'))) {
+      return 'dashboard';
+    }
     return guestFlag ? 'dashboard' : 'login';
   });
 
   const [language, setLanguage] = useState<Language>(() => {
-    return (localStorage.getItem('mediguide_language') as Language) || 'en';
+    const storedLanguage = localStorage.getItem('mediguide_language');
+    return storedLanguage === 'te' || storedLanguage === 'hi' ? storedLanguage : 'en';
   });
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('mediguide_theme') === 'dark');
   const [initialSampleId, setInitialSampleId] = useState<string | null>(null);
+  const [initialChatQuestion, setInitialChatQuestion] = useState('');
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -39,12 +49,31 @@ export function App() {
     localStorage.setItem('mediguide_language', lang);
   };
 
+  const handleThemeChange = () => {
+    setDarkMode((previous) => {
+      const next = !previous;
+      localStorage.setItem('mediguide_theme', next ? 'dark' : 'light');
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode);
+    document.documentElement.style.colorScheme = darkMode ? 'dark' : 'light';
+  }, [darkMode]);
+
   const handleNavigate = (tab: NavigationTab, sampleId?: string) => {
+    if (tab !== 'chat') setInitialChatQuestion('');
     if (sampleId) {
       setInitialSampleId(sampleId);
     }
     setActiveTab(tab);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleContinueChat = (question: string) => {
+    setInitialChatQuestion(question);
+    handleNavigate('chat');
   };
 
   const handleLoginSuccess = (user: UserProfile, token: string, rememberMe = true) => {
@@ -180,7 +209,7 @@ export function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-800">
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-800 transition-colors">
       {/* 1. Medical Safety Disclaimer Banner (Top) */}
       <DisclaimerBanner language={language} />
 
@@ -188,10 +217,12 @@ export function App() {
       <Navbar
         language={language}
         onLanguageChange={handleLanguageChange}
-        onSelectTab={setActiveTab}
+        onSelectTab={handleNavigate}
         health={health}
         mobileMenuOpen={mobileMenuOpen}
         onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}
+        darkMode={darkMode}
+        onToggleDarkMode={handleThemeChange}
         currentUser={currentUser}
         onSignOut={handleSignOut}
         onSignInClick={() => setActiveTab('login')}
@@ -201,7 +232,7 @@ export function App() {
       <div className="flex-1 flex max-w-7xl w-full mx-auto">
         <Sidebar
           activeTab={activeTab}
-          onSelectTab={setActiveTab}
+          onSelectTab={handleNavigate}
           language={language}
           mobileMenuOpen={mobileMenuOpen}
           onCloseMobileMenu={() => setMobileMenuOpen(false)}
@@ -222,6 +253,7 @@ export function App() {
             <ReportAnalyzerPage
               language={language}
               onLanguageChange={handleLanguageChange}
+              token={getStoredAuthToken()}
               initialSampleId={initialSampleId}
               onClearInitialSampleId={() => setInitialSampleId(null)}
             />
@@ -231,15 +263,42 @@ export function App() {
             <ChatAssistantPage
               language={language}
               onLanguageChange={handleLanguageChange}
+              token={getStoredAuthToken()}
+              initialQuestion={initialChatQuestion}
             />
           )}
 
           {activeTab === 'comparison' && (
-            <ReportComparisonPage language={language} />
+            <ReportComparisonPage language={language} token={getStoredAuthToken()} />
           )}
 
           {activeTab === 'sources' && (
             <SourcesPage language={language} />
+          )}
+
+          {activeTab === 'healthTips' && (
+            <HealthTipsPage language={language} />
+          )}
+
+          {activeTab === 'emergency' && (
+            <EmergencyPage language={language} />
+          )}
+
+          {activeTab === 'history' && (
+            <HistoryPage
+              language={language}
+              token={getStoredAuthToken()}
+              onContinueChat={handleContinueChat}
+            />
+          )}
+
+          {activeTab === 'account' && (
+            <AccountPage
+              language={language}
+              user={currentUser}
+              token={getStoredAuthToken()}
+              onUserUpdated={setCurrentUser}
+            />
           )}
 
           {activeTab === 'settings' && (
@@ -254,37 +313,37 @@ export function App() {
       </div>
 
       {/* 4. Global Footer */}
-      <footer className="bg-white border-t border-slate-200/80 py-6 px-4 sm:px-8 mt-auto">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
+      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200/80 dark:border-slate-800 py-6 px-4 sm:px-8 mt-auto">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
           <div className="flex items-center gap-2">
             <div className="w-5 h-5 rounded-md bg-indigo-600 flex items-center justify-center text-white">
               <HeartHandshake className="w-3 h-3" />
             </div>
-            <span className="font-semibold text-slate-700">MediGuide AI</span>
+            <span className="font-semibold text-slate-700 dark:text-slate-200">MediGuide AI</span>
             <span>•</span>
             <span>Understand Your Health, Make Informed Decisions.</span>
           </div>
 
           <div className="flex items-center gap-4 text-[11px]">
-            <span className="flex items-center gap-1 text-slate-600">
+            <span className="flex items-center gap-1 text-slate-600 dark:text-slate-300">
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-              Educational & Informational Only
+              {language === 'te' ? 'విద్యా & సమాచార ప్రయోజనాల కోసం మాత్రమే' : language === 'hi' ? 'केवल शैक्षिक और सूचनात्मक उपयोग के लिए' : 'Educational & Informational Only'}
             </span>
             <span>•</span>
             <button
-              onClick={() => setActiveTab('settings')}
-              className="hover:text-indigo-600 underline"
+              onClick={() => handleNavigate('settings')}
+              className="hover:text-indigo-600 dark:hover:text-indigo-400 underline"
             >
-              Privacy & Zero Retention
+              {language === 'te' ? 'గోప్యత & డేటా నియంత్రణలు' : language === 'hi' ? 'गोपनीयता और डेटा नियंत्रण' : 'Privacy & Data Controls'}
             </button>
             {currentUser && (
               <>
                 <span>•</span>
                 <button
                   onClick={handleSignOut}
-                  className="hover:text-rose-600 underline"
+                  className="hover:text-rose-600 dark:hover:text-rose-400 underline"
                 >
-                  Sign Out ({currentUser.name})
+                  {language === 'te' ? 'సైన్ అవుట్' : language === 'hi' ? 'साइन आउट' : 'Sign Out'} ({currentUser.name})
                 </button>
               </>
             )}

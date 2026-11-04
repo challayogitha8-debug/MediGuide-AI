@@ -16,7 +16,6 @@ import {
   AlertCircle,
   X,
   HelpCircle,
-  ArrowLeft,
   KeyRound,
 } from 'lucide-react';
 import { UserProfile, Language } from '../types';
@@ -26,9 +25,7 @@ import {
   forgotPasswordApi,
   resetPasswordApi,
   fetchGoogleAuthUrl,
-  fetchAppleAuthUrl,
   exchangeGoogleOAuth,
-  exchangeAppleOAuth,
 } from '../services/api';
 import { MedicalHeartStethoscope } from '../components/illustrations/MedicalHeartStethoscope';
 import doctorHeroImg from '../assets/doctor_hero.jpg';
@@ -38,8 +35,6 @@ interface LoginPageProps {
   onLoginSuccess: (user: UserProfile, token: string, rememberMe?: boolean) => void;
   onExploreAsGuest: () => void;
 }
-
-type RoleMode = 'all' | 'doctor' | 'patient';
 
 function createOAuthState(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -51,9 +46,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   onLoginSuccess,
   onExploreAsGuest,
 }) => {
-  // Role selection mode: 'all' (initial with role selection options), 'doctor', or 'patient'
-  const [selectedRole, setSelectedRole] = useState<RoleMode>('all');
-
   // Form states
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -61,7 +53,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [rememberMe, setRememberMe] = useState(true);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
-  const [appleLoading, setAppleLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
@@ -72,7 +63,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   );
   const [showOAuthModal, setShowOAuthModal] = useState<{
     open: boolean;
-    provider: 'Google' | 'Apple';
+    provider: 'Google';
     configured: boolean;
     message: string;
     requiredVars?: string[];
@@ -87,9 +78,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [signupName, setSignupName] = useState('');
   const [signupEmail, setSignupEmail] = useState('');
   const [signupPassword, setSignupPassword] = useState('');
-  const [signupRole, setSignupRole] = useState<'patient' | 'doctor'>('patient');
-  const [signupLicense, setSignupLicense] = useState('');
-  const [signupDoctorInviteCode, setSignupDoctorInviteCode] = useState('');
   const [signupLoading, setSignupLoading] = useState(false);
   const [signupError, setSignupError] = useState<string | null>(null);
 
@@ -108,7 +96,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     const params = new URLSearchParams(window.location.search);
     const fragment = new URLSearchParams(window.location.hash.slice(1));
     const code = params.get('code');
-    const ticket = params.get('oauth_ticket') || fragment.get('oauth_ticket');
     const provider =
       params.get('oauth_provider') ||
       fragment.get('oauth_provider') ||
@@ -130,7 +117,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       return;
     }
 
-    if ((code || ticket) && !oauthHandled.current) {
+    if (code && !oauthHandled.current) {
       oauthHandled.current = true;
       const handleOAuthReturn = async () => {
         try {
@@ -138,23 +125,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           if (!state || !expectedState || state !== expectedState) {
             throw new Error('OAuth state validation failed. Please try again.');
           }
-          const expectedRoleValue = sessionStorage.getItem('mediguide_oauth_role');
-          const expectedRole =
-            expectedRoleValue === 'doctor' || expectedRoleValue === 'patient'
-              ? expectedRoleValue
-              : undefined;
-          let res;
-          if (provider === 'apple' && ticket) {
-            res = await exchangeAppleOAuth({ ticket, expected_role: expectedRole });
-          } else if (provider === 'google' && code) {
-            res = await exchangeGoogleOAuth({
-              code,
-              redirect_uri: sessionStorage.getItem('mediguide_oauth_redirect_uri') || undefined,
-              expected_role: expectedRole,
-            });
-          } else {
+          if (provider !== 'google') {
             throw new Error('OAuth provider response was invalid. Please try again.');
           }
+          const res = await exchangeGoogleOAuth({
+            code,
+            redirect_uri: sessionStorage.getItem('mediguide_oauth_redirect_uri') || undefined,
+          });
           if (res.success && res.user && res.token) {
             onLoginSuccess(res.user, res.token, rememberMe);
           } else {
@@ -167,7 +144,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           sessionStorage.removeItem('mediguide_oauth_state');
           sessionStorage.removeItem('mediguide_oauth_provider');
           sessionStorage.removeItem('mediguide_oauth_redirect_uri');
-          sessionStorage.removeItem('mediguide_oauth_role');
           window.history.replaceState({}, document.title, window.location.pathname);
         }
       };
@@ -191,12 +167,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
     try {
       setLoading(true);
-      const expectedRole = selectedRole === 'all' ? null : selectedRole;
       const res = await loginApi({
         email: email.trim(),
         password,
         remember_me: rememberMe,
-        expected_role: expectedRole,
       });
 
       if (res.success && res.user && res.token) {
@@ -223,20 +197,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       return;
     }
 
-    if (signupRole === 'doctor' && (!signupLicense.trim() || signupLicense.trim().length < 5)) {
-      setSignupError('A valid physician license number (at least 5 characters) is required for Doctor accounts.');
-      return;
-    }
-
     try {
       setSignupLoading(true);
       const res = await signupApi({
         name: signupName.trim(),
         email: signupEmail.trim(),
         password: signupPassword,
-        role: signupRole,
-        medical_license: signupRole === 'doctor' ? signupLicense.trim() : undefined,
-        doctor_invite_code: signupRole === 'doctor' ? signupDoctorInviteCode : undefined,
       });
 
       if (res.success && res.user && res.token) {
@@ -313,7 +279,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       const state = createOAuthState();
       sessionStorage.setItem('mediguide_oauth_state', state);
       sessionStorage.setItem('mediguide_oauth_provider', 'google');
-      sessionStorage.setItem('mediguide_oauth_role', selectedRole);
       const res = await fetchGoogleAuthUrl(state);
 
       if (res.configured && res.auth_url) {
@@ -323,7 +288,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       } else {
         sessionStorage.removeItem('mediguide_oauth_state');
         sessionStorage.removeItem('mediguide_oauth_provider');
-        sessionStorage.removeItem('mediguide_oauth_role');
+        sessionStorage.removeItem('mediguide_oauth_redirect_uri');
         setShowOAuthModal({
           open: true,
           provider: 'Google',
@@ -333,43 +298,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         });
       }
     } catch (err: unknown) {
+      sessionStorage.removeItem('mediguide_oauth_state');
+      sessionStorage.removeItem('mediguide_oauth_provider');
+      sessionStorage.removeItem('mediguide_oauth_redirect_uri');
       setErrorMessage(err instanceof Error ? err.message : 'Failed to initialize Google authentication.');
     } finally {
       setGoogleLoading(false);
-    }
-  };
-
-  // Apple OAuth Flow
-  const handleAppleClick = async () => {
-    if (appleLoading) return;
-    try {
-      setAppleLoading(true);
-      setErrorMessage(null);
-      const state = createOAuthState();
-      sessionStorage.setItem('mediguide_oauth_state', state);
-      sessionStorage.setItem('mediguide_oauth_provider', 'apple');
-      sessionStorage.setItem('mediguide_oauth_role', selectedRole);
-      const res = await fetchAppleAuthUrl(state);
-
-      if (res.configured && res.auth_url) {
-        sessionStorage.removeItem('mediguide_guest');
-        window.location.href = res.auth_url;
-      } else {
-        sessionStorage.removeItem('mediguide_oauth_state');
-        sessionStorage.removeItem('mediguide_oauth_provider');
-        sessionStorage.removeItem('mediguide_oauth_role');
-        setShowOAuthModal({
-          open: true,
-          provider: 'Apple',
-          configured: false,
-          message: res.message,
-          requiredVars: res.required_env_vars || ['APPLE_CLIENT_ID', 'APPLE_TEAM_ID', 'APPLE_KEY_ID', 'APPLE_PRIVATE_KEY'],
-        });
-      }
-    } catch (err: unknown) {
-      setErrorMessage(err instanceof Error ? err.message : 'Failed to initialize Apple authentication.');
-    } finally {
-      setAppleLoading(false);
     }
   };
 
@@ -444,7 +378,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               </div>
               <div>
                 <h4 className="text-sm font-bold text-[#0B1F4D]">Get AI Health Guidance</h4>
-                <p className="text-[11px] text-[#52658A]">Bilingual English & Telugu</p>
+                <p className="text-[11px] text-[#52658A]">English, Telugu & Hindi</p>
               </div>
             </div>
 
@@ -492,7 +426,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   Clinical AI Companion
                 </span>
                 <span className="bg-blue-600/80 backdrop-blur-md px-2.5 py-1 rounded-full text-[10px]">
-                  Bilingual English & Telugu
+                  English, Telugu & Hindi
                 </span>
               </div>
             </div>
@@ -545,113 +479,19 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               <MedicalHeartStethoscope className="w-12 h-12" size={48} />
             </div>
 
-            {/* Card Header & Dynamic Role Badge */}
+            {/* Card Header */}
             <div className="pr-12">
-              {selectedRole === 'doctor' ? (
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-100 border border-blue-200 text-blue-700 text-xs font-bold mb-2">
-                  <Stethoscope className="w-3.5 h-3.5 text-blue-600" />
-                  Doctor Login Portal
-                </div>
-              ) : selectedRole === 'patient' ? (
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-100 border border-cyan-200 text-cyan-800 text-xs font-bold mb-2">
-                  <Heart className="w-3.5 h-3.5 text-[#0284C7]" />
-                  Patient Login Portal
-                </div>
-              ) : (
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 border border-blue-100 text-[#1677FF] text-xs font-semibold mb-2">
-                  <ShieldCheck className="w-3.5 h-3.5 text-[#1677FF]" />
-                  Secure Health Portal
-                </div>
-              )}
-
-              <h2 className="text-2xl sm:text-3xl font-extrabold text-[#0B1F4D] tracking-tight">
-                {selectedRole === 'doctor'
-                  ? 'Doctor Sign In'
-                  : selectedRole === 'patient'
-                  ? 'Patient Sign In'
-                  : 'Welcome Back'}
-              </h2>
-              <p className="mt-1 text-sm text-[#52658A]">
-                {selectedRole === 'doctor'
-                  ? 'Access physician clinical review workspace'
-                  : selectedRole === 'patient'
-                  ? 'Access your personal medical reports and AI explanations'
-                  : 'Sign in to access your personal health dashboard'}
-              </p>
-            </div>
-
-            {/* Role Selection Buttons (Doctor Login / Patient Login) */}
-            <div className="mt-5">
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedRole(selectedRole === 'doctor' ? 'all' : 'doctor');
-                    setErrorMessage(null);
-                    setSuccessMessage(null);
-                  }}
-                  className={`flex items-center justify-center gap-2.5 py-3 px-3 rounded-2xl border text-xs font-bold transition-all hover:scale-[1.02] active:scale-[0.99] cursor-pointer shadow-2xs ${
-                    selectedRole === 'doctor'
-                      ? 'bg-blue-600 border-blue-700 text-white shadow-md shadow-blue-500/20'
-                      : 'bg-blue-50/80 hover:bg-blue-100/90 border-blue-200/80 text-[#0B1F4D]'
-                  }`}
-                >
-                  <div
-                    className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${
-                      selectedRole === 'doctor'
-                        ? 'bg-white text-blue-600'
-                        : 'bg-blue-600 text-white'
-                    }`}
-                  >
-                    <Stethoscope className="w-4 h-4" />
-                  </div>
-                  <span>Doctor Login</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedRole(selectedRole === 'patient' ? 'all' : 'patient');
-                    setErrorMessage(null);
-                    setSuccessMessage(null);
-                  }}
-                  className={`flex items-center justify-center gap-2.5 py-3 px-3 rounded-2xl border text-xs font-bold transition-all hover:scale-[1.02] active:scale-[0.99] cursor-pointer shadow-2xs ${
-                    selectedRole === 'patient'
-                      ? 'bg-[#0284C7] border-[#0369a1] text-white shadow-md shadow-cyan-500/20'
-                      : 'bg-cyan-50/80 hover:bg-cyan-100/90 border-cyan-200/80 text-[#0B1F4D]'
-                  }`}
-                >
-                  <div
-                    className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${
-                      selectedRole === 'patient'
-                        ? 'bg-white text-[#0284C7]'
-                        : 'bg-[#0284C7] text-white'
-                    }`}
-                  >
-                    <Heart className="w-4 h-4" />
-                  </div>
-                  <span>Patient Login</span>
-                </button>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 border border-blue-100 text-[#1677FF] text-xs font-semibold mb-2">
+                <ShieldCheck className="w-3.5 h-3.5 text-[#1677FF]" />
+                Secure Health Portal
               </div>
 
-              {selectedRole !== 'all' && (
-                <div className="mt-2.5 flex items-center justify-between">
-                  <span className="text-[11px] text-[#52658A] flex items-center gap-1 font-medium">
-                    Filtered to: <strong className="capitalize text-[#0B1F4D]">{selectedRole} role</strong>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedRole('all');
-                      setErrorMessage(null);
-                    }}
-                    className="text-[11px] font-semibold text-[#1677FF] hover:underline flex items-center gap-1"
-                  >
-                    <ArrowLeft className="w-3 h-3" />
-                    Back to role selection
-                  </button>
-                </div>
-              )}
+              <h2 className="text-2xl sm:text-3xl font-extrabold text-[#0B1F4D] tracking-tight">
+                Welcome Back
+              </h2>
+              <p className="mt-1 text-sm text-[#52658A]">
+                Sign in to access your MediGuide AI account
+              </p>
             </div>
 
             {/* Error / Success Notifications */}
@@ -677,11 +517,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   htmlFor="email-input"
                   className="block text-xs font-bold text-[#0B1F4D] mb-1.5 uppercase tracking-wider"
                 >
-                  {selectedRole === 'doctor'
-                    ? 'Physician Email Address'
-                    : selectedRole === 'patient'
-                    ? 'Patient Email Address'
-                    : 'Email Address'}
+                  Email Address
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
@@ -692,13 +528,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder={
-                      selectedRole === 'doctor'
-                        ? 'doctor@hospital.org'
-                        : selectedRole === 'patient'
-                        ? 'patient@example.com'
-                        : 'name@example.com'
-                    }
+                    placeholder="name@example.com"
                     autoComplete="email"
                     required
                     className="w-full pl-10 pr-4 py-3 bg-[#F5F8FC] border border-[#D8E3F2] rounded-xl text-sm text-[#0B1F4D] placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#1677FF]/40 focus:border-[#1677FF] transition-all"
@@ -778,11 +608,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                 ) : (
                   <>
                     <span>
-                      {selectedRole === 'doctor'
-                        ? 'Sign In as Doctor'
-                        : selectedRole === 'patient'
-                        ? 'Sign In as Patient'
-                        : 'Sign In'}
+                      Sign In
                     </span>
                     <ArrowRight className="w-4 h-4" />
                   </>
@@ -806,7 +632,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               <button
                 type="button"
                 onClick={handleGoogleClick}
-                disabled={googleLoading || appleLoading}
+                disabled={googleLoading}
                 className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl border border-[#D8E3F2] bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 transition-colors shadow-2xs disabled:opacity-50 cursor-pointer"
               >
                 {googleLoading ? (
@@ -837,17 +663,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               {/* Apple Button */}
               <button
                 type="button"
-                onClick={handleAppleClick}
-                disabled={googleLoading || appleLoading}
-                className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl border border-[#D8E3F2] bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 transition-colors shadow-2xs disabled:opacity-50 cursor-pointer"
+                disabled
+                title="Apple sign-in is coming soon"
+                aria-label="Continue with Apple (coming soon)"
+                className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl border border-[#D8E3F2] bg-white text-xs font-semibold text-slate-700 transition-colors shadow-2xs disabled:cursor-not-allowed disabled:opacity-70"
               >
-                {appleLoading ? (
-                  <div className="w-4 h-4 border-2 border-slate-900 border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <svg className="w-4 h-4 shrink-0 fill-current text-slate-900" viewBox="0 0 24 24">
-                    <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.86c.64-.78 1.08-1.86.96-2.95-.93.04-2.09.62-2.75 1.4-.58.67-1.09 1.76-.95 2.81 1.05.08 2.12-.52 2.74-1.26" />
-                  </svg>
-                )}
+                <svg className="w-4 h-4 shrink-0 fill-current text-slate-900" viewBox="0 0 24 24">
+                  <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.86c.64-.78 1.08-1.86.96-2.95-.93.04-2.09.62-2.75 1.4-.58.67-1.09 1.76-.95 2.81 1.05.08 2.12-.52 2.74-1.26" />
+                </svg>
                 <span>Continue with Apple</span>
               </button>
             </div>
@@ -926,76 +749,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   type="text"
                   value={signupName}
                   onChange={(e) => setSignupName(e.target.value)}
-                  placeholder="e.g. Dr. Alex Morgan or Alex Taylor"
+                  placeholder="e.g. Alex Morgan"
                   required
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30"
                 />
               </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Account Role</label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setSignupRole('patient')}
-                    className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                      signupRole === 'patient'
-                        ? 'bg-cyan-50 border-cyan-300 text-cyan-800'
-                        : 'bg-slate-50 border-slate-200 text-slate-600'
-                    }`}
-                  >
-                    <Heart className="w-3.5 h-3.5" />
-                    Patient
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSignupRole('doctor')}
-                    className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                      signupRole === 'doctor'
-                        ? 'bg-blue-50 border-blue-300 text-blue-800'
-                        : 'bg-slate-50 border-slate-200 text-slate-600'
-                    }`}
-                  >
-                    <Stethoscope className="w-3.5 h-3.5" />
-                    Doctor
-                  </button>
-                </div>
-              </div>
-
-              {signupRole === 'doctor' && (
-                <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl">
-                  <label className="block text-xs font-bold text-blue-900 mb-1">
-                    Physician Medical License Number *
-                  </label>
-                  <input
-                    type="text"
-                    value={signupLicense}
-                    onChange={(e) => setSignupLicense(e.target.value)}
-                    placeholder="e.g. MD-984321"
-                    required
-                    className="w-full px-3 py-2 bg-white border border-blue-200 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-                  />
-                  <p className="mt-1 text-[10px] text-blue-700">
-                    A physician license number and administrator-issued authorization code are required.
-                  </p>
-                </div>
-              )}
-
-              {signupRole === 'doctor' && (
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Doctor Authorization Code
-                  </label>
-                  <input
-                    type="password"
-                    value={signupDoctorInviteCode}
-                    onChange={(e) => setSignupDoctorInviteCode(e.target.value)}
-                    autoComplete="off"
-                    required
-                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-                  />
-                </div>
-              )}
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">Email Address</label>

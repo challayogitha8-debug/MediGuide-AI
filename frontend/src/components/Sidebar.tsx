@@ -8,7 +8,10 @@ import {
   ShieldCheck,
   HeartHandshake,
   CheckCircle2,
-  UserCheck,
+  Dumbbell,
+  Siren,
+  History,
+  CircleUserRound,
 } from 'lucide-react';
 import { Language, NavigationTab } from '../types';
 
@@ -32,16 +35,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'dashboard' as NavigationTab,
       label_en: 'Dashboard',
       label_te: 'డాష్‌బోర్డ్',
+      label_hi: 'डैशबोर्ड',
       desc_en: 'Overview & quick actions',
       desc_te: 'అవలోకనం & శీఘ్ర చర్యలు',
+      desc_hi: 'अवलोकन और त्वरित विकल्प',
       icon: LayoutDashboard,
     },
     {
       id: 'analyzer' as NavigationTab,
       label_en: 'Report Analyzer',
       label_te: 'రిపోర్ట్ ఎనలైజర్',
+      label_hi: 'रिपोर्ट विश्लेषक',
       desc_en: 'PDF upload & lab insights',
       desc_te: 'PDF విశ్లేషణ & ల్యాబ్ ఫలితాలు',
+      desc_hi: 'PDF अपलोड और लैब जानकारी',
       icon: FileText,
       badge: 'Core',
     },
@@ -49,8 +56,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'chat' as NavigationTab,
       label_en: 'AI Health Assistant',
       label_te: 'AI హెల్త్ అసిస్టెంట్',
+      label_hi: 'AI स्वास्थ्य सहायक',
       desc_en: 'Bilingual health Q&A',
       desc_te: 'ద్విభాషా ఆరోగ్య సహాయం',
+      desc_hi: 'स्वास्थ्य संबंधी प्रश्न और उत्तर',
       icon: MessageSquareText,
       badge: 'Interactive',
     },
@@ -58,33 +67,71 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'comparison' as NavigationTab,
       label_en: 'Report Comparison',
       label_te: 'రిపోర్ట్ పోలిక',
+      label_hi: 'रिपोर्ट तुलना',
       desc_en: 'Longitudinal trend graphs',
       desc_te: 'కాలక్రమేణా మార్పుల గ్రాఫ్స్',
+      desc_hi: 'समय के साथ रुझान',
       icon: GitCompare,
+    },
+    {
+      id: 'healthTips' as NavigationTab,
+      label_en: 'Health Tips',
+      label_te: 'ఆరోగ్య సూచనలు',
+      label_hi: 'स्वास्थ्य सुझाव',
+      desc_en: 'Movement & nutrition',
+      desc_te: 'వ్యాయామం & పోషకాహారం',
+      desc_hi: 'व्यायाम और पोषण',
+      icon: Dumbbell,
+    },
+    {
+      id: 'emergency' as NavigationTab,
+      label_en: 'Emergency',
+      label_te: 'అత్యవసర సహాయం',
+      label_hi: 'आपातकालीन सहायता',
+      desc_en: 'Urgent contacts & nearby care',
+      desc_te: 'అత్యవసర సంప్రదింపులు & సమీప సేవలు',
+      desc_hi: 'आपातकालीन संपर्क और पास की सहायता',
+      icon: Siren,
     },
     {
       id: 'sources' as NavigationTab,
       label_en: 'Health Sources',
       label_te: 'వైద్య సమాచార వనరులు',
+      label_hi: 'स्वास्थ्य स्रोत',
       desc_en: 'WHO, MedlinePlus, CDC',
       desc_te: 'విశ్వసనీయ వైద్య ప్రమాణాలు',
+      desc_hi: 'WHO, MedlinePlus, CDC',
       icon: BookOpenCheck,
+    },
+    {
+      id: 'history' as NavigationTab,
+      label_en: 'History',
+      label_te: 'చరిత్ర',
+      label_hi: 'इतिहास',
+      desc_en: 'Your reports & conversations',
+      desc_te: 'మీ నివేదికలు & సంభాషణలు',
+      desc_hi: 'आपकी रिपोर्ट और बातचीत',
+      icon: History,
+    },
+    {
+      id: 'account' as NavigationTab,
+      label_en: 'My Account',
+      label_te: 'నా ఖాతా',
+      label_hi: 'मेरा खाता',
+      desc_en: 'Profile & account details',
+      desc_te: 'ప్రొఫైల్ & ఖాతా వివరాలు',
+      desc_hi: 'प्रोफ़ाइल और खाता विवरण',
+      icon: CircleUserRound,
     },
     {
       id: 'settings' as NavigationTab,
       label_en: 'Privacy & Settings',
       label_te: 'గోప్యత & సెట్టింగ్‌లు',
+      label_hi: 'गोपनीयता और सेटिंग',
       desc_en: 'Report processing & API status',
       desc_te: 'డేటా భద్రత & సిస్టమ్ స్థితి',
+      desc_hi: 'रिपोर्ट प्रसंस्करण और API स्थिति',
       icon: ShieldCheck,
-    },
-    {
-      id: 'login' as NavigationTab,
-      label_en: 'Account Portal',
-      label_te: 'ఖాతా పోర్టల్',
-      desc_en: 'Sign in & healthcare profiles',
-      desc_te: 'డాక్టర్ & పేషెంట్ లాగిన్',
-      icon: UserCheck,
     },
   ];
 
@@ -128,7 +175,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {/* Navigation List */}
         <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
           <div className="px-3 mb-2 text-[11px] font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
-            {language === 'te' ? 'నావిగేషన్' : 'Main Menu'}
+            {language === 'te' ? 'నావిగేషన్' : language === 'hi' ? 'मुख्य मेनू' : 'Main Menu'}
           </div>
 
           {navItems.map((item) => {
@@ -156,7 +203,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between">
                     <span className="text-sm truncate">
-                      {language === 'te' ? item.label_te : item.label_en}
+                      {language === 'te' ? item.label_te : language === 'hi' ? item.label_hi : item.label_en}
                     </span>
                     {item.badge && (
                       <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300">
@@ -165,7 +212,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     )}
                   </div>
                   <p className="text-[11px] text-slate-400 dark:text-slate-500 truncate">
-                    {language === 'te' ? item.desc_te : item.desc_en}
+                    {language === 'te' ? item.desc_te : language === 'hi' ? item.desc_hi : item.desc_en}
                   </p>
                 </div>
               </button>

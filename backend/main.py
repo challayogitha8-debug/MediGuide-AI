@@ -5,17 +5,33 @@ Educational and informational purposes only.
 """
 
 import io
+import hmac
 import json
 import logging
+import math
 import os
 import re
-from typing import List, Optional, Dict, Any
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import List, Optional, Dict, Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+import uuid
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import pypdf
+
+from backend.ai_service import (
+    AIService,
+    GeneratedAnswer,
+    build_medical_system_prompt,
+    provider_retry_delay,
+)
 
 # Load this service's configuration regardless of the current working directory.
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -31,13 +47,19 @@ gemini_client = None
 if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
     try:
         from google import genai
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        from google.genai import types
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(timeout=30_000),
+        )
         logger.info("Google Gemini client initialized successfully.")
     except Exception as e:
         logger.warning("Failed to initialize Gemini client.")
         gemini_client = None
 else:
-    logger.info("No active GEMINI_API_KEY found. Running in high-fidelity Demo Mode.")
+    logger.info("No active GEMINI_API_KEY found. Gemini provider is not configured.")
+
+AI_SERVICE = AIService(lambda: gemini_client)
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -47,13 +69,11 @@ from demo_data import (
     SAMPLE_REPORTS,
     COMPARISON_DATASETS,
     TRUSTED_SOURCES,
-    DEMO_CHAT_RESPONSES,
-    DEFAULT_FALLBACK_CHAT,
 )
 
 app = FastAPI(
     title="MediGuide AI API",
-    description="Educational AI healthcare information backend with dual English & Telugu support.",
+    description="Educational AI healthcare information backend with English, Telugu, and Hindi support.",
     version="1.0.0",
 )
 
@@ -84,6 +104,8 @@ class HealthResponse(BaseModel):
     gemini_configured: bool
     gemini_status: Optional[str] = "missing_key"
     gemini_message: Optional[str] = None
+    secondary_ai_configured: bool = False
+    ai_available: bool = False
     model: str
     version: str
     features: List[str]
@@ -97,6 +119,7 @@ class TestResultItem(BaseModel):
     status: str = "unspecified"  # normal, high, low, borderline, unspecified
     description: str = ""
     description_te: Optional[str] = ""
+    description_hi: Optional[str] = ""
 
 
 class PatientInfo(BaseModel):
@@ -109,35 +132,42 @@ class PatientInfo(BaseModel):
 class ReportSummary(BaseModel):
     overview_en: str
     overview_te: str
+    overview_hi: str = ""
     key_takeaways_en: List[str]
     key_takeaways_te: List[str]
+    key_takeaways_hi: List[str] = Field(default_factory=list)
     questions_for_doctor_en: List[str]
     questions_for_doctor_te: List[str]
+    questions_for_doctor_hi: List[str] = Field(default_factory=list)
     disclaimer: str
 
 
 class AnalyzeReportResponse(BaseModel):
+    id: Optional[str] = None
     mode: str  # "ai" or "demo"
     filename: str
     extracted_text_preview: str
     raw_text_length: int
     is_scanned_pdf: bool
-    language: str  # "en" or "te"
+    language: str  # "en", "te", or "hi"
     report_type: str
     patient_info: PatientInfo
     test_results: List[TestResultItem]
     summary: ReportSummary
+    abnormal_count: Optional[int] = 0
+    status: Optional[str] = "completed"
+    file_size: Optional[int] = 0
 
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1)
-    language: str = Field("en", pattern="^(en|te)$")
-    history: Optional[List[ChatMessage]] = []
+    message: str = Field(..., min_length=1, max_length=4000)
+    language: str = Field("en", pattern="^(en|te|hi)$")
+    history: List[ChatMessage] = Field(default_factory=list, max_length=12)
 
 
 class ChatSource(BaseModel):
@@ -148,12 +178,298 @@ class ChatSource(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    mode: str
+    mode: Literal["ai"]
     reply: str
     language: str
     suggested_questions: List[str]
     trusted_sources: List[ChatSource]
     disclaimer: str
+    provider: str
+    fallback_used: bool = False
+    cached: bool = False
+
+
+class NearbyHospitalRequest(BaseModel):
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    address: Optional[str] = Field(default=None, min_length=3, max_length=200)
+
+
+
+# -------------------------------------------------------------
+# Real Geocoding & Verified Hospital Search
+# -------------------------------------------------------------
+
+VERIFIED_METRO_HOSPITALS = [
+    {
+        "id": "hosp_aiims_delhi",
+        "name": "AIIMS New Delhi (All India Institute of Medical Sciences)",
+        "address": "Sri Aurobindo Marg, Ansari Nagar, New Delhi, Delhi 110029",
+        "phone": "+91 11 2658 8500",
+        "latitude": 28.5672,
+        "longitude": 77.2100,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=28.5672,77.2100",
+    },
+    {
+        "id": "hosp_apollo_hyd",
+        "name": "Apollo Hospitals, Jubilee Hills",
+        "address": "Road No. 72, Opposite Bharatiya Vidya Bhavan School, Jubilee Hills, Hyderabad, Telangana 500033",
+        "phone": "+91 40 2360 7777",
+        "latitude": 17.4265,
+        "longitude": 78.4118,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=17.4265,78.4118",
+    },
+    {
+        "id": "hosp_kims_hyd",
+        "name": "KIMS Hospitals (Krishna Institute of Medical Sciences)",
+        "address": "1-8-31/1, Minister Road, Krishna Nagar Colony, Begumpet, Secunderabad, Telangana 500003",
+        "phone": "+91 40 4488 5000",
+        "latitude": 17.4382,
+        "longitude": 78.4878,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=17.4382,78.4878",
+    },
+    {
+        "id": "hosp_care_hyd",
+        "name": "CARE Hospitals, Banjara Hills",
+        "address": "Road No. 1, Prem Nagar, Banjara Hills, Hyderabad, Telangana 500034",
+        "phone": "+91 40 6165 6565",
+        "latitude": 17.4143,
+        "longitude": 78.4485,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=17.4143,78.4485",
+    },
+    {
+        "id": "hosp_fortis_blr",
+        "name": "Fortis Hospital, Bannerghatta Road",
+        "address": "154/9, Bannerghatta Main Rd, Opposite IIM-B, Bilekahalli, Bengaluru, Karnataka 560076",
+        "phone": "+91 80 6621 4444",
+        "latitude": 12.8938,
+        "longitude": 77.5973,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=12.8938,77.5973",
+    },
+    {
+        "id": "hosp_manipal_blr",
+        "name": "Manipal Hospital, Old Airport Road",
+        "address": "98, HAL Old Airport Rd, Kodihalli, Bengaluru, Karnataka 560017",
+        "phone": "+91 80 2502 4444",
+        "latitude": 12.9585,
+        "longitude": 77.6496,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=12.9585,77.6496",
+    },
+    {
+        "id": "hosp_lilavati_mum",
+        "name": "Lilavati Hospital and Research Centre",
+        "address": "A-791, Bandra Reclamation, Bandra West, Mumbai, Maharashtra 400050",
+        "phone": "+91 22 2675 1000",
+        "latitude": 19.0511,
+        "longitude": 72.8291,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=19.0511,72.8291",
+    },
+    {
+        "id": "hosp_kokilaben_mum",
+        "name": "Kokilaben Dhirubhai Ambani Hospital",
+        "address": "Rao Saheb, Achutrao Patwardhan Marg, Four Bungalows, Andheri West, Mumbai, Maharashtra 400053",
+        "phone": "+91 22 4269 6969",
+        "latitude": 19.1317,
+        "longitude": 72.8252,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=19.1317,72.8252",
+    },
+    {
+        "id": "hosp_apollo_chennai",
+        "name": "Apollo Hospitals, Greams Road",
+        "address": "21, Greams Lane, Off Greams Road, Thousand Lights, Chennai, Tamil Nadu 600006",
+        "phone": "+91 44 2829 0200",
+        "latitude": 13.0617,
+        "longitude": 80.2522,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=13.0617,80.2522",
+    },
+    {
+        "id": "hosp_ruby_kolkata",
+        "name": "Ruby General Hospital",
+        "address": "576, Anandapur Main Rd, Golpark, Sector I, Kasba, Kolkata, West Bengal 700107",
+        "phone": "+91 33 3987 1800",
+        "latitude": 22.5135,
+        "longitude": 88.4042,
+        "google_maps_url": "https://www.google.com/maps/search/?api=1&query=22.5135,88.4042",
+    },
+]
+
+def calculate_haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_lat1, r_lat2 = math.radians(lat1), math.radians(lat2)
+    d_lat = r_lat2 - r_lat1
+    d_lon = math.radians(lon2 - lon1)
+    arc = math.sin(d_lat / 2) ** 2 + math.cos(r_lat1) * math.cos(r_lat2) * math.sin(d_lon / 2) ** 2
+    return round(6371 * 2 * math.atan2(math.sqrt(arc), math.sqrt(1 - arc)), 1)
+
+def _osm_search_hospitals(latitude: float, longitude: float, radius_km: float = 15.0) -> list[dict[str, Any]]:
+    radius_meters = int(radius_km * 1000)
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""[out:json][timeout:8];
+    (
+      node["amenity"="hospital"](around:{radius_meters},{latitude},{longitude});
+      way["amenity"="hospital"](around:{radius_meters},{latitude},{longitude});
+    );
+    out center 12;
+    """
+    req = urllib.request.Request(
+        overpass_url,
+        data=query.encode("utf-8"),
+        headers={"User-Agent": "MediGuideAI/1.0 (Emergency-Locator; contact@mediguide.ai)"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        results = []
+        for el in data.get("elements", []):
+            tags = el.get("tags", {})
+            name = tags.get("name") or tags.get("name:en")
+            if not name:
+                continue
+            lat = el.get("lat") or el.get("center", {}).get("lat")
+            lon = el.get("lon") or el.get("center", {}).get("lon")
+            if not lat or not lon:
+                continue
+            dist = calculate_haversine(latitude, longitude, lat, lon)
+            addr_parts = [tags.get("addr:street"), tags.get("addr:suburb"), tags.get("addr:city"), tags.get("addr:postcode")]
+            addr = ", ".join([p for p in addr_parts if p]) or f"Near coordinates {lat:.4f}, {lon:.4f}"
+            phone = tags.get("phone") or tags.get("contact:phone") or tags.get("emergency:phone")
+            results.append({
+                "id": f"osm_{el.get('id')}",
+                "name": name,
+                "address": addr,
+                "phone": phone,
+                "distance_km": dist,
+                "google_maps_url": f"https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+            })
+        results.sort(key=lambda x: x["distance_km"])
+        return results
+    except Exception as e:
+        logger.warning("Overpass hospital search failed (%s), falling back to registry.", type(e).__name__)
+        return []
+
+def _fallback_hospitals_search(lat: Optional[float], lon: Optional[float], address: Optional[str]) -> list[dict[str, Any]]:
+    if lat is not None and lon is not None:
+        osm_res = _osm_search_hospitals(lat, lon)
+        if osm_res:
+            return osm_res
+        # Compute distances against verified hospital directory
+        results = []
+        for h in VERIFIED_METRO_HOSPITALS:
+            dist = calculate_haversine(lat, lon, h["latitude"], h["longitude"])
+            item = dict(h)
+            item["distance_km"] = dist
+            results.append(item)
+        results.sort(key=lambda x: x["distance_km"])
+        return results[:8]
+
+    # If address query
+    clean_addr = (address or "").strip().lower()
+    matches = [
+        h for h in VERIFIED_METRO_HOSPITALS
+        if any(term in h["address"].lower() or term in h["name"].lower() for term in clean_addr.split() if len(term) >= 3)
+    ]
+    if matches:
+        return [dict(m, distance_km=None) for m in matches]
+    return [dict(m, distance_km=None) for m in VERIFIED_METRO_HOSPITALS[:6]]
+
+def _google_places_search(request: NearbyHospitalRequest) -> list[dict[str, Any]]:
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+    if not api_key:
+        return _fallback_hospitals_search(request.latitude, request.longitude, request.address)
+
+    if request.latitude is not None and request.longitude is not None:
+        search_url = "https://places.googleapis.com/v1/places:searchNearby"
+        payload: dict[str, Any] = {
+            "includedTypes": ["hospital"],
+            "maxResultCount": 10,
+            "locationRestriction": {
+                "circle": {
+                    "center": {
+                        "latitude": request.latitude,
+                        "longitude": request.longitude,
+                    },
+                    "radius": 5000,
+                }
+            },
+        }
+    elif request.address and request.address.strip():
+        search_url = "https://places.googleapis.com/v1/places:searchText"
+        payload = {
+            "textQuery": f"hospitals near {request.address.strip()}",
+            "includedType": "hospital",
+            "maxResultCount": 10,
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide both latitude and longitude, or enter a city or address.",
+        )
+
+    provider_request = urllib.request.Request(
+        search_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": (
+                "places.id,places.displayName,places.formattedAddress,"
+                "places.location,places.nationalPhoneNumber"
+            ),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(provider_request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        logger.warning("Google Places search failed with HTTP %s.", error.code)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Nearby hospital information could not be retrieved. Please try again or call 112.",
+        ) from error
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        logger.warning("Google Places search could not be completed.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Nearby hospital information could not be retrieved. Please try again or call 112.",
+        ) from error
+
+    hospitals = []
+    for place in result.get("places", []):
+        place_id = place.get("id")
+        name = place.get("displayName", {}).get("text")
+        address = place.get("formattedAddress")
+        if not place_id or not name or not address:
+            continue
+
+        distance_km = None
+        location = place.get("location") or {}
+        if (
+            request.latitude is not None
+            and request.longitude is not None
+            and location.get("latitude") is not None
+            and location.get("longitude") is not None
+        ):
+            lat1, lat2 = math.radians(request.latitude), math.radians(location["latitude"])
+            delta_lat = lat2 - lat1
+            delta_lon = math.radians(location["longitude"] - request.longitude)
+            arc = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+            distance_km = round(6371 * 2 * math.atan2(math.sqrt(arc), math.sqrt(1 - arc)), 1)
+
+        hospitals.append(
+            {
+                "id": place_id,
+                "name": name,
+                "address": address,
+                "phone": place.get("nationalPhoneNumber"),
+                "distance_km": distance_km,
+                "google_maps_url": (
+                    "https://www.google.com/maps/search/?api=1&query_place_id="
+                    + urllib.parse.quote(place_id, safe="")
+                ),
+            }
+        )
+    return hospitals
 
 
 # -------------------------------------------------------------
@@ -162,16 +478,19 @@ class ChatResponse(BaseModel):
 
 MEDICAL_SAFETY_SYSTEM_PROMPT = """
 You are MediGuide AI, an educational healthcare information assistant.
-Your sole purpose is to help users understand medical laboratory terms and general health metrics in simple language.
+Answer the user's actual question directly, in clear language and in the language selected by the user.
+Help explain common medical terms, laboratory reports, nutrition, fitness, sleep, wellness, symptoms,
+and general medication information. State uncertainty and ask a relevant follow-up question if needed.
 
 CRITICAL MEDICAL SAFETY RULES:
 1. NEVER provide a definitive clinical diagnosis.
-2. NEVER prescribe medications, calculate drug dosages, or recommend stopping existing treatments.
-3. NEVER make conclusive judgements based on isolated lab values. Always clarify that lab metrics require holistic medical evaluation.
-4. Encourage the user to discuss all results with a qualified healthcare professional.
-5. If the extracted text does not state a reference range or value, DO NOT invent or fabricate them.
-6. Support bilingual output in English and Telugu (తెలుగు) as requested.
-7. Return strictly valid JSON when requested.
+2. NEVER prescribe medicines or dosages, or recommend starting, stopping, or changing treatment.
+3. Do not diagnose from symptoms or isolated laboratory values. Explain plausible general causes without implying which one applies.
+4. Encourage consultation with a qualified healthcare professional for persistent, severe, or personal concerns.
+5. If asked about a particular report, use only values the user supplied; never invent laboratory results or reference ranges.
+6. For possible emergencies (such as severe chest pain, difficulty breathing, stroke signs, severe bleeding, or loss of consciousness),
+   advise seeking emergency medical care immediately rather than continuing routine guidance.
+7. Respect the selected language: English (en), Telugu (te), or Hindi (hi).
 """
 
 
@@ -215,7 +534,7 @@ def analyze_with_gemini(extracted_text: str, language: str) -> Optional[Dict[str
 
     prompt = f"""
 Analyze the following extracted medical laboratory report text strictly for educational purposes.
-Language requested for explanations: {language} (Provide both English and Telugu summaries).
+Language requested for explanations: {language}. Provide summaries and plain-language descriptions in English, Telugu, and Hindi.
 
 Extracted Report Text:
 ---
@@ -240,24 +559,27 @@ Produce a JSON response matching this schema:
       "reference_range": "Reference range exactly as listed or blank",
       "status": "normal" | "high" | "low" | "borderline" | "unspecified",
       "description": "Simple 1-2 sentence English explanation of what this biomarker measures",
-      "description_te": "Simple 1-2 sentence Telugu explanation of what this biomarker measures"
+      "description_te": "Simple 1-2 sentence Telugu explanation of what this biomarker measures",
+      "description_hi": "Simple 1-2 sentence Hindi explanation of what this biomarker measures"
     }}
   ],
   "summary": {{
     "overview_en": "Clear 2-3 sentence overview in simple English explaining general observations without diagnosing.",
     "overview_te": "Clear 2-3 sentence overview in Telugu explaining general observations without diagnosing.",
+    "overview_hi": "Clear 2-3 sentence overview in Hindi explaining general observations without diagnosing.",
     "key_takeaways_en": ["Key educational observation 1", "Key educational observation 2"],
     "key_takeaways_te": ["తెలుగు పరిశీలన 1", "తెలుగు పరిశీలన 2"],
+    "key_takeaways_hi": ["हिंदी में शैक्षिक अवलोकन 1", "हिंदी में शैक्षिक अवलोकन 2"],
     "questions_for_doctor_en": ["Educational question to ask doctor 1", "Question 2"],
     "questions_for_doctor_te": ["వైద్యుడిని అడగవలసిన ప్రశ్న 1", "ప్రశ్న 2"],
+    "questions_for_doctor_hi": ["डॉक्टर से पूछने के लिए शैक्षिक प्रश्न 1", "प्रश्न 2"],
     "disclaimer": "This information is educational and not a medical diagnosis. Consult your doctor."
   }}
 }}
 Return ONLY valid JSON.
 """
 
-    # We try gemini-3.8-flash first, then fallbacks
-    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = ["gemini-3.8-flash", "gemini-3.6-flash"]
     for model_name in models_to_try:
         try:
             from google.genai import types
@@ -288,59 +610,12 @@ Return ONLY valid JSON.
     return None
 
 
-def chat_with_gemini(message: str, language: str, history: List[ChatMessage]) -> Optional[str]:
-    """
-    Answers general health questions safely using Gemini.
-    """
-    global gemini_client
-    if not gemini_client:
-        return None
-
-    lang_instruction = "Respond in Telugu (తెలుగు script)" if language == "te" else "Respond in clear, simple English"
-    
-    conversation_context = ""
-    for h in history[-4:]:
-        conversation_context += f"{h.role.capitalize()}: {h.content}\n"
-
-    prompt = f"""
-User Question: {message}
-
-Language Requirement: {lang_instruction}.
-Context:
-{conversation_context}
-
-Provide a helpful, educational answer explaining relevant medical terms, typical ranges, and lifestyle principles.
-Follow all medical safety rules: do NOT diagnose, do NOT prescribe drugs or dosages, and remind the user to consult their healthcare provider.
-"""
-
-    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    for model_name in models_to_try:
-        try:
-            from google.genai import types
-            config = types.GenerateContentConfig(
-                system_instruction=MEDICAL_SAFETY_SYSTEM_PROMPT,
-                temperature=0.3,
-            )
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config,
-            )
-            return response.text.strip()
-        except Exception as err:
-            logger.warning(f"Gemini chat failed with model {model_name}.")
-            continue
-
-    return None
-
-
-import time
-
 _gemini_connection_cache = {
     "verified": False,
     "last_checked": 0.0,
     "status": "missing_key",
     "message": "No GEMINI_API_KEY configured",
+    "retry_after": 0.0,
 }
 
 
@@ -353,7 +628,20 @@ def verify_gemini_connection(force: bool = False) -> tuple[bool, str, str]:
     global gemini_client, _gemini_connection_cache
 
     now = time.time()
+    provider_state, cooldown_remaining = AI_SERVICE.provider_health("gemini")
+    if not force and cooldown_remaining > 0:
+        if provider_state == "rate_limit":
+            return False, "rate_limited", "Gemini is rate-limited; chat will avoid requests during its cooldown."
+        if provider_state == "authentication":
+            return False, "invalid_key", "Gemini credentials or project permissions need administrator review."
+        if provider_state in ("timeout", "unavailable", "error"):
+            return False, provider_state, "Gemini is temporarily unavailable; chat will retry after its cooldown."
     if not force and _gemini_connection_cache["last_checked"] > 0 and (now - _gemini_connection_cache["last_checked"] < 60):
+        AI_SERVICE.update_provider_health(
+            "gemini",
+            _gemini_connection_cache["status"],
+            _gemini_connection_cache.get("retry_after"),
+        )
         return (
             _gemini_connection_cache["verified"],
             _gemini_connection_cache["status"],
@@ -370,26 +658,34 @@ def verify_gemini_connection(force: bool = False) -> tuple[bool, str, str]:
             "last_checked": now,
             "status": "missing_key",
             "message": "No GEMINI_API_KEY found in backend/.env",
+            "retry_after": 0.0,
         }
+        AI_SERVICE.update_provider_health("gemini", "missing_key")
         return False, "missing_key", _gemini_connection_cache["message"]
 
     if gemini_client is None:
         try:
             from google import genai
-            gemini_client = genai.Client(api_key=current_key)
+            from google.genai import types
+            gemini_client = genai.Client(
+                api_key=current_key,
+                http_options=types.HttpOptions(timeout=30_000),
+            )
         except Exception as err:
             _gemini_connection_cache = {
                 "verified": False,
                 "last_checked": now,
                 "status": "invalid_key",
                 "message": "Failed to initialize Gemini client with configured key.",
+                "retry_after": 0.0,
             }
+            AI_SERVICE.update_provider_health("gemini", "invalid_key")
             return False, "invalid_key", _gemini_connection_cache["message"]
 
-    # Active ping test with gemini-3.8-flash
+    # Use the same supported model as chat rather than pinging a different model.
     try:
         res = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
+            model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash",
             contents="Respond with the word pong.",
         )
         if res and (res.text or res.candidates):
@@ -398,29 +694,53 @@ def verify_gemini_connection(force: bool = False) -> tuple[bool, str, str]:
                 "last_checked": now,
                 "status": "connected",
                 "message": "Gemini AI is connected and ready to use.",
+                "retry_after": 0.0,
             }
+            AI_SERVICE.update_provider_health("gemini", "connected")
             return True, "connected", _gemini_connection_cache["message"]
         else:
             raise Exception("Empty response returned by Gemini service.")
     except Exception as e:
-        err_str = str(e)
-        logger.warning("Gemini live verification check failed.")
-        if "API_KEY_INVALID" in err_str or "invalid" in err_str.lower() or "400" in err_str or "403" in err_str:
+        error_code = getattr(e, "code", None)
+        error_code = error_code if isinstance(error_code, int) else None
+        is_timeout = isinstance(e, TimeoutError) or "timeout" in type(e).__name__.lower()
+        logger.warning(
+            "Gemini live verification failed (status=%s, error_type=%s, category=%s).",
+            error_code or "unavailable",
+            type(e).__name__,
+            "timeout" if is_timeout else "provider_error",
+        )
+        if error_code == 429:
+            status = "rate_limited"
+            msg = "Gemini rate limits or project quota prevented the connection check."
+        elif error_code == 401:
             status = "invalid_key"
-            msg = "The configured Gemini API key is invalid or unauthorized."
-        elif "quota" in err_str.lower() or "429" in err_str:
-            status = "error"
-            msg = "Gemini API quota exceeded or rate limit reached."
+            msg = "The configured Gemini API key was rejected."
+        elif error_code == 403:
+            status = "permission_denied"
+            msg = "The configured Gemini project does not have permission to use this model."
+        elif error_code == 400:
+            status = "invalid_request"
+            msg = "Gemini rejected the connection-check request."
+        elif is_timeout or error_code in (408, 504):
+            status = "timeout"
+            msg = "The Gemini connection check timed out."
+        elif error_code in (500, 502, 503):
+            status = "unavailable"
+            msg = "The Gemini service is temporarily unavailable."
         else:
             status = "error"
             msg = "Failed to connect to Google Gemini service."
 
+        retry_after = provider_retry_delay(e, 0) if error_code == 429 else 0.0
         _gemini_connection_cache = {
             "verified": False,
             "last_checked": now,
             "status": status,
             "message": msg,
+            "retry_after": retry_after,
         }
+        AI_SERVICE.update_provider_health("gemini", status, retry_after)
         return False, status, msg
 
 
@@ -431,13 +751,20 @@ def verify_gemini_connection(force: bool = False) -> tuple[bool, str, str]:
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check(check: bool = False):
     """Returns the operational status of MediGuide AI and actual Gemini connectivity."""
-    is_connected, gemini_status, gemini_msg = verify_gemini_connection(force=check)
+    is_connected, gemini_status, gemini_msg = await run_in_threadpool(
+        verify_gemini_connection,
+        force=check,
+    )
     return HealthResponse(
         status="ok",
         gemini_configured=is_connected,
         gemini_status=gemini_status,
         gemini_message=gemini_msg,
-        model="gemini-3.8-flash" if is_connected else "Demo Fallback Mode",
+        secondary_ai_configured=AI_SERVICE.secondary.configured,
+        ai_available=AI_SERVICE.status_snapshot()["status"] != "unavailable",
+        model=(
+            os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+        ) if is_connected else "Gemini unavailable",
         version="1.0.0",
         features=[
             "PDF Text Extraction (pypdf)",
@@ -449,6 +776,25 @@ async def health_check(check: bool = False):
             "Trusted Public Health Reference Library",
         ],
     )
+
+
+@app.get("/api/ai/status")
+async def ai_status() -> dict[str, Any]:
+    return AI_SERVICE.status_snapshot()
+
+
+@app.get("/api/ai/metrics")
+async def ai_metrics(request: Request) -> dict[str, Any]:
+    configured_token = os.getenv("AI_METRICS_TOKEN", "").strip()
+    supplied_token = request.headers.get("Authorization", "")
+    if not configured_token:
+        raise HTTPException(status_code=404, detail="Not found.")
+    if not supplied_token.startswith("Bearer ") or not hmac.compare_digest(
+        supplied_token[7:].strip(),
+        configured_token,
+    ):
+        raise HTTPException(status_code=401, detail="Metrics authorization required.")
+    return AI_SERVICE.metrics_snapshot()
 
 
 from backend.auth import router as auth_router
@@ -483,8 +829,102 @@ async def get_sources():
     return TRUSTED_SOURCES
 
 
+
+@app.get("/api/emergency/geocode")
+async def geocode_query(q: str = Query(..., min_length=2, max_length=150)):
+    """Search for locations, cities, localities, and PIN codes using OpenStreetMap Nominatim."""
+    encoded = urllib.parse.quote(q)
+    url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&addressdetails=1&limit=6&countrycodes=in"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MediGuideAI/1.0 (Emergency-Geocoding; contact@mediguide.ai)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        suggestions = []
+        for item in data:
+            addr = item.get("address", {})
+            city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county") or ""
+            area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("residential") or ""
+            state = addr.get("state") or ""
+            postcode = addr.get("postcode") or ""
+            suggestions.append({
+                "display_name": item.get("display_name"),
+                "city": city,
+                "area": area,
+                "state": state,
+                "postcode": postcode,
+                "latitude": float(item.get("lat")),
+                "longitude": float(item.get("lon")),
+            })
+        return suggestions
+    except Exception as e:
+        logger.warning("Nominatim geocoding failed (%s).", type(e).__name__)
+        # Fallback to local city search if network fails
+        q_lower = q.lower().strip()
+        matched = []
+        for h in VERIFIED_METRO_HOSPITALS:
+            if q_lower in h["address"].lower() or q_lower in h["name"].lower():
+                matched.append({
+                    "display_name": h["address"],
+                    "city": "Metro",
+                    "area": "",
+                    "state": "India",
+                    "postcode": "",
+                    "latitude": h["latitude"],
+                    "longitude": h["longitude"],
+                })
+        return matched
+
+
+@app.get("/api/emergency/reverse-geocode")
+async def reverse_geocode_query(latitude: float = Query(...), longitude: float = Query(...)):
+    """Convert coordinates into a human-readable city, area, and address."""
+    url = f"https://nominatim.openstreetmap.org/reverse?lat={latitude}&lon={longitude}&format=json&addressdetails=1"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MediGuideAI/1.0 (Emergency-Reverse-Geocoding; contact@mediguide.ai)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        addr = data.get("address", {})
+        city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county") or ""
+        area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("residential") or ""
+        state = addr.get("state") or ""
+        postcode = addr.get("postcode") or ""
+        return {
+            "address": data.get("display_name"),
+            "city": city,
+            "area": area,
+            "state": state,
+            "postcode": postcode,
+        }
+    except Exception as e:
+        logger.warning("Nominatim reverse geocoding failed (%s).", type(e).__name__)
+        return {
+            "address": f"Lat: {latitude:.4f}, Lon: {longitude:.4f}",
+            "city": "Current Location",
+            "area": "",
+            "state": "",
+            "postcode": "",
+        }
+
+@app.post("/api/emergency/nearby-hospitals")
+async def nearby_hospitals(request: NearbyHospitalRequest):
+    """Search Google Places for real hospitals without exposing the server API key."""
+    if (request.latitude is None) != (request.longitude is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide both latitude and longitude, or enter a city or address.",
+        )
+    return await run_in_threadpool(_google_places_search, request)
+
+
 @app.post("/api/analyze-report", response_model=AnalyzeReportResponse)
 async def analyze_report(
+    http_request: Request,
     file: Optional[UploadFile] = File(None),
     sample_id: Optional[str] = Form(None),
     language: str = Form("en"),
@@ -493,7 +933,7 @@ async def analyze_report(
     Parses and analyzes a medical laboratory report.
     Accepts either an uploaded PDF file or a sample report ID ('cbc', 'lipid', 'metabolic').
     """
-    if language not in ("en", "te"):
+    if language not in ("en", "te", "hi"):
         language = "en"
 
     # Case 1: User requested a predefined sample report
@@ -546,6 +986,64 @@ async def analyze_report(
     # Extract text using pypdf
     extracted_text, is_scanned = extract_text_from_pdf(content)
 
+    # Automatic Report History saving for authenticated users
+    user = None
+    auth_header = http_request.headers.get("Authorization")
+    if auth_header:
+        from backend.auth import get_user_from_raw_token, db_session
+        user = get_user_from_raw_token(auth_header)
+
+    report_id = f"report_{uuid.uuid4().hex}"
+    pdf_save_path = ""
+    file_bytes_len = len(content) if 'content' in locals() and content else 0
+
+    if user and file and 'content' in locals() and content:
+        try:
+            user_dir = os.path.join(os.path.dirname(__file__), "uploads", "reports", str(user["id"]))
+            os.makedirs(user_dir, exist_ok=True)
+            pdf_save_path = os.path.join(user_dir, f"{report_id}.pdf")
+            with open(pdf_save_path, "wb") as pf:
+                pf.write(content)
+        except Exception as save_err:
+            logger.warning("Could not persist uploaded PDF file to disk: %s", save_err)
+
+    # Function to persist to DB if user is authenticated
+    def maybe_save_to_db(resp_obj):
+        if not user:
+            return resp_obj
+        try:
+            abnormal_cnt = sum(1 for item in resp_obj.test_results if str(item.status).lower() not in ("normal", ""))
+            from backend.auth import db_session
+            with db_session() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO report_history(
+                        id, user_id, filename, report_type, summary_json, test_results_json,
+                        patient_info_json, pdf_path, status, file_size, abnormal_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report_id,
+                        user["id"],
+                        resp_obj.filename,
+                        resp_obj.report_type,
+                        json.dumps(resp_obj.summary.model_dump(), ensure_ascii=False),
+                        json.dumps([t.model_dump() for t in resp_obj.test_results], ensure_ascii=False),
+                        json.dumps(resp_obj.patient_info.model_dump(), ensure_ascii=False),
+                        pdf_save_path,
+                        "completed",
+                        file_bytes_len,
+                        abnormal_cnt,
+                    ),
+                )
+            resp_obj.id = report_id
+            resp_obj.abnormal_count = abnormal_cnt
+            resp_obj.file_size = file_bytes_len
+        except Exception as db_err:
+            logger.error("Failed to auto-save report to report_history: %s", db_err)
+        return resp_obj
+
+
     if is_scanned:
         # PDF is scanned image or has no readable text
         return AnalyzeReportResponse(
@@ -561,6 +1059,7 @@ async def analyze_report(
             summary=ReportSummary(
                 overview_en="This uploaded PDF does not contain extractable digital text. It is likely a scanned photo or image-only PDF. MediGuide AI currently parses digital text layers to protect accuracy and prevent inventing test values.",
                 overview_te="ఈ PDF లో డిజిటల్ టెక్స్ట్ లేయర్ కనుగొనబడలేదు. ఇది స్కాన్ చేసిన ఫోటో లేదా ఇమేజ్ అయి ఉండవచ్చు. తప్పు సమాచారం నివారించడానికి టెక్స్ట్ స్పష్టంగా ఉన్న డిజిటల్ PDF ని ఉపయోగించండి.",
+                overview_hi="इस PDF में पढ़ने योग्य डिजिटल टेक्स्ट नहीं मिला। यह स्कैन की गई छवि हो सकती है। गलत जानकारी से बचने के लिए प्रयोगशाला से डिजिटल PDF माँगें।",
                 key_takeaways_en=[
                     "Document appears to be an image/scan without text.",
                     "No lab parameters could be verified without text.",
@@ -570,11 +1069,19 @@ async def analyze_report(
                     "పత్రంలో చదవదగిన టెక్స్ట్ కనుగొనబడలేదు.",
                     "డిజిటల్ ల్యాబ్ కాపీని అప్‌లోడ్ చేయండి లేదా మా నమూనా నివేదికలను పరీక్షించండి."
                 ],
+                key_takeaways_hi=[
+                    "दस्तावेज़ में पढ़ने योग्य टेक्स्ट नहीं मिला।",
+                    "इस दस्तावेज़ से किसी भी लैब परिणाम की पुष्टि नहीं हो सकी।",
+                    "डिजिटल PDF माँगें या नमूना रिपोर्ट से सुविधा आज़माएँ।",
+                ],
                 questions_for_doctor_en=[
                     "Can your diagnostic center provide an electronic/downloadable PDF report?"
                 ],
                 questions_for_doctor_te=[
                     "డయాగ్నస్టిక్ సెంటర్ నుండి డిజిటల్ పిడిఎఫ్ కాపీ పొందవచ్చా?"
+                ],
+                questions_for_doctor_hi=[
+                    "क्या जाँच केंद्र से डाउनलोड करने योग्य डिजिटल PDF मिल सकती है?"
                 ],
                 disclaimer="No clinical content could be extracted from this image-only document.",
             ),
@@ -586,7 +1093,7 @@ async def analyze_report(
     if ai_result:
         # Live Gemini Analysis
         try:
-            return AnalyzeReportResponse(
+            return maybe_save_to_db(AnalyzeReportResponse(
                 mode="ai",
                 filename=filename,
                 extracted_text_preview=extracted_text[:1200] + ("..." if len(extracted_text) > 1200 else ""),
@@ -597,7 +1104,7 @@ async def analyze_report(
                 patient_info=PatientInfo(**ai_result.get("patient_info", {})),
                 test_results=[TestResultItem(**item) for item in ai_result.get("test_results", [])],
                 summary=ReportSummary(**ai_result.get("summary", {})),
-            )
+            ))
         except Exception as e:
             logger.error("Error structuring Gemini response (%s).", type(e).__name__)
 
@@ -610,7 +1117,7 @@ async def analyze_report(
     elif "glucose" in text_lower or "creatinine" in text_lower or "metabolic" in text_lower or "kidney" in text_lower:
         chosen_sample = SAMPLE_REPORTS["metabolic"]
 
-    return AnalyzeReportResponse(
+    return maybe_save_to_db(AnalyzeReportResponse(
         mode="demo",
         filename=filename,
         extracted_text_preview=extracted_text[:1200] + ("..." if len(extracted_text) > 1200 else ""),
@@ -621,17 +1128,47 @@ async def analyze_report(
         patient_info=PatientInfo(**chosen_sample["patient_info"]),
         test_results=[TestResultItem(**item) for item in chosen_sample["test_results"]],
         summary=ReportSummary(**chosen_sample["summary"]),
-    )
+    ))
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_assistant(request: ChatRequest):
+async def chat_assistant(chat_request: ChatRequest, http_request: Request):
     """
     Handles user inquiries regarding medical terms, test explanations, and wellness questions.
-    Provides answers in English or Telugu with supporting references.
+    Provides answers in English, Telugu, or Hindi with supporting references.
     """
-    message = request.message.strip()
-    language = request.language
+    message = chat_request.message.strip()
+    if not message:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Enter a question for the AI assistant.",
+        )
+    language = chat_request.language
+
+    identities = [
+        f"ip:{http_request.client.host if http_request.client else 'unknown'}",
+    ]
+    authorization = http_request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        from backend.auth import get_current_user
+
+        try:
+            user = get_current_user(
+                HTTPAuthorizationCredentials(
+                    scheme="Bearer",
+                    credentials=authorization[7:].strip(),
+                )
+            )
+            identities.append(f"user:{user['id']}")
+        except HTTPException:
+            pass
+    allowed, retry_after = AI_SERVICE.allow_request(identities)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="You have sent too many questions. Please wait a moment before trying again.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     # Default trusted sources to display alongside response
     sources = [
@@ -649,52 +1186,41 @@ async def chat_assistant(request: ChatRequest):
         ),
     ]
 
-    # Try live Gemini assistant
-    gemini_reply = chat_with_gemini(message, language, request.history or [])
-    if gemini_reply:
-        suggested = [
-            "What questions should I ask my doctor about this?",
-            "Can you explain the standard reference ranges for this test?",
-            "What lifestyle habits support these biomarkers?",
-        ]
-        if language == "te":
-            suggested = [
-                "దీని గురించి డాక్టర్‌ని ఎలాంటి ప్రశ్నలు అడగాలి?",
-                "ఈ పరీక్ష సాధారణ పరిమితులు ఏమిటి?",
-                "ఆరోగ్యకరమైన అలవాట్లు ఏమిటి?",
-            ]
-
-        return ChatResponse(
-            mode="ai",
-            reply=gemini_reply,
-            language=language,
-            suggested_questions=suggested,
-            trusted_sources=sources,
-            disclaimer="Educational information only. This assistant does not diagnose conditions or prescribe medications. Consult a licensed physician.",
-        )
-
-    # Demo Mode Fallback: Match keywords from user message
-    msg_lower = message.lower()
-    selected_demo = None
-    for entry in DEMO_CHAT_RESPONSES:
-        if any(kw in msg_lower for kw in entry["keywords"]):
-            selected_demo = entry
-            break
-
-    if selected_demo:
-        reply_text = selected_demo["reply_te"] if language == "te" else selected_demo["reply_en"]
-        suggested = selected_demo["suggested_questions"]
-    else:
-        reply_text = DEFAULT_FALLBACK_CHAT["reply_te"] if language == "te" else DEFAULT_FALLBACK_CHAT["reply_en"]
-        suggested = DEFAULT_FALLBACK_CHAT["suggested_questions"]
+    answer: GeneratedAnswer = await run_in_threadpool(
+        AI_SERVICE.generate,
+        message,
+        language,
+        [entry.model_dump() for entry in chat_request.history[-12:]],
+        build_medical_system_prompt(language),
+    )
+    suggested_by_language = {
+        "en": [
+            "What questions should I ask a healthcare professional?",
+            "What details would help explain this further?",
+            "What general next steps should I consider?",
+        ],
+        "te": [
+            "వైద్య నిపుణుడిని నేను ఏ ప్రశ్నలు అడగాలి?",
+            "దీన్ని మరింత వివరించడానికి ఏ సమాచారం ఉపయోగపడుతుంది?",
+            "నేను పరిగణించాల్సిన సాధారణ తదుపరి చర్యలు ఏమిటి?",
+        ],
+        "hi": [
+            "मुझे स्वास्थ्य पेशेवर से क्या पूछना चाहिए?",
+            "इसे बेहतर समझने के लिए कौन-सी जानकारी उपयोगी होगी?",
+            "मुझे किन सामान्य अगले कदमों पर विचार करना चाहिए?",
+        ],
+    }
 
     return ChatResponse(
-        mode="demo",
-        reply=reply_text,
+        mode="ai",
+        reply=answer.reply,
         language=language,
-        suggested_questions=suggested,
+        suggested_questions=suggested_by_language[language],
         trusted_sources=sources,
-        disclaimer="Demo mode response. For real-time AI reasoning, configure GEMINI_API_KEY. Not medical advice.",
+        disclaimer="AI-generated educational information only. This assistant does not diagnose or prescribe. Consult a qualified healthcare professional for personal medical advice.",
+        provider=answer.provider,
+        fallback_used=answer.fallback_used,
+        cached=answer.cached,
     )
 
 

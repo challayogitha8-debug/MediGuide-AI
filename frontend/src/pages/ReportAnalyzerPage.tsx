@@ -19,11 +19,12 @@ import {
   FileSearch,
 } from 'lucide-react';
 import { AnalyzeReportResponse, Language, TestStatus } from '../types';
-import { analyzeReport } from '../services/api';
+import { analyzeReport, saveReportHistory } from '../services/api';
 
 interface ReportAnalyzerPageProps {
   language: Language;
   onLanguageChange: (lang: Language) => void;
+  token: string | null;
   initialSampleId?: string | null;
   onClearInitialSampleId?: () => void;
 }
@@ -31,6 +32,7 @@ interface ReportAnalyzerPageProps {
 export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
   language,
   onLanguageChange,
+  token,
   initialSampleId,
   onClearInitialSampleId,
 }) => {
@@ -38,6 +40,7 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [historySaveError, setHistorySaveError] = useState<string | null>(null);
   const [reportData, setReportData] = useState<AnalyzeReportResponse | null>(null);
   const [showRawText, setShowRawText] = useState<boolean>(false);
   const [copiedText, setCopiedText] = useState<boolean>(false);
@@ -84,6 +87,7 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
   const executeAnalysis = useCallback(async (params: { file?: File; sampleId?: string }) => {
     setLoading(true);
     setErrorMsg(null);
+    setHistorySaveError(null);
     setUploadProgress(20);
 
     const interval = setInterval(() => {
@@ -96,6 +100,26 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
         sampleId: params.sampleId,
         language,
       });
+      if (params.file && token) {
+        if (response.mode === 'ai') {
+          try {
+            await saveReportHistory(token, response);
+            setHistorySaveError(null);
+          } catch (historyError: unknown) {
+            setHistorySaveError(
+              historyError instanceof Error ? historyError.message : 'Could not save report history.',
+            );
+          }
+        } else {
+          setHistorySaveError(
+            language === 'te'
+              ? 'డెమో వివరణలో నమూనా విలువలు ఉన్నాయి; అవి మీ నిజమైన ఫలితాలు కావు కాబట్టి చరిత్రలో సేవ్ చేయలేదు.'
+              : language === 'hi'
+                ? 'इस डेमो विश्लेषण में उदाहरण मान हैं, आपके वास्तविक परिणाम नहीं; इसे इतिहास में सहेजा नहीं गया।'
+                : 'Demo analysis contains illustrative values, not your actual results, so it was not saved to history.',
+          );
+        }
+      }
       clearInterval(interval);
       setUploadProgress(100);
       setTimeout(() => {
@@ -107,7 +131,7 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
       setLoading(false);
       setErrorMsg(err.message || 'An error occurred while processing the report.');
     }
-  }, [language]);
+  }, [language, token]);
 
   const handleLoadSample = useCallback((sampleId: string) => {
     setErrorMsg(null);
@@ -202,6 +226,14 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
               }`}
             >
               తెలుగు
+            </button>
+            <button
+              onClick={() => onLanguageChange('hi')}
+              className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${
+                language === 'hi' ? 'bg-white text-indigo-700 shadow-xs' : 'text-slate-600'
+              }`}
+            >
+              हिन्दी
             </button>
           </div>
 
@@ -321,6 +353,11 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
               <p className="text-xs text-rose-700 mt-0.5">{errorMsg}</p>
             </div>
           </div>
+        )}
+        {historySaveError && (
+          <p role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+            {language === 'te' ? 'చరిత్ర: ' : language === 'hi' ? 'इतिहास: ' : 'History: '}{historySaveError}
+          </p>
         )}
       </div>
 
@@ -498,7 +535,9 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
                             </span>
                             {language === 'te' && item.description_te
                               ? item.description_te
-                              : item.description}
+                              : language === 'hi' && item.description_hi
+                                ? item.description_hi
+                                : item.description}
                           </td>
                         </tr>
                       </React.Fragment>
@@ -531,7 +570,9 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
               <p className="text-sm text-slate-700 leading-relaxed font-normal">
                 {language === 'te'
                   ? reportData.summary.overview_te || reportData.summary.overview_en
-                  : reportData.summary.overview_en}
+                  : language === 'hi'
+                    ? reportData.summary.overview_hi || reportData.summary.overview_en
+                    : reportData.summary.overview_en}
               </p>
             </div>
 
@@ -548,7 +589,9 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
                 <ul className="space-y-2 text-xs text-slate-600">
                   {(language === 'te' && reportData.summary.key_takeaways_te?.length
                     ? reportData.summary.key_takeaways_te
-                    : reportData.summary.key_takeaways_en
+                    : language === 'hi' && reportData.summary.key_takeaways_hi?.length
+                      ? reportData.summary.key_takeaways_hi
+                      : reportData.summary.key_takeaways_en
                   ).map((point, i) => (
                     <li key={i} className="flex items-start gap-2">
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 mt-1.5 shrink-0" />
@@ -569,7 +612,9 @@ export const ReportAnalyzerPage: React.FC<ReportAnalyzerPageProps> = ({
                 <ul className="space-y-2 text-xs text-slate-600">
                   {(language === 'te' && reportData.summary.questions_for_doctor_te?.length
                     ? reportData.summary.questions_for_doctor_te
-                    : reportData.summary.questions_for_doctor_en
+                    : language === 'hi' && reportData.summary.questions_for_doctor_hi?.length
+                      ? reportData.summary.questions_for_doctor_hi
+                      : reportData.summary.questions_for_doctor_en
                   ).map((q, i) => (
                     <li key={i} className="flex items-start gap-2">
                       <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />

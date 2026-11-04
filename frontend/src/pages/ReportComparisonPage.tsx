@@ -19,36 +19,140 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts';
-import { ComparisonDataset, Language } from '../types';
-import { fetchComparisonData } from '../services/api';
+import { ComparisonDataset, Language, ReportHistoryEntry } from '../types';
+import { fetchComparisonData, fetchUserHistory } from '../services/api';
 
 interface ReportComparisonPageProps {
   language: Language;
+  token: string | null;
 }
 
-export const ReportComparisonPage: React.FC<ReportComparisonPageProps> = ({ language }) => {
+const numericValue = (value: string | number): number | null => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const normalized = value.trim();
+  if (!/^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalize = (value: string) => value.trim().replace(/\s+/g, ' ').toLowerCase();
+
+export const ReportComparisonPage: React.FC<ReportComparisonPageProps> = ({ language, token }) => {
   const [datasets, setDatasets] = useState<Record<string, ComparisonDataset> | null>(null);
   const [selectedKey, setSelectedKey] = useState<string>('lipid_panel');
+  const [userReports, setUserReports] = useState<ReportHistoryEntry[]>([]);
+  const [reportAId, setReportAId] = useState('');
+  const [reportBId, setReportBId] = useState('');
   const [loading, setLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     async function loadData() {
       try {
-        const data = await fetchComparisonData();
-        setDatasets(data);
+        if (token) {
+          const history = await fetchUserHistory(token);
+          if (!active) return;
+          const actualReports = history.reports
+            .filter((report) => report.test_results.length > 0)
+            .sort((a, b) => b.analyzed_at.localeCompare(a.analyzed_at));
+          setUserReports(actualReports);
+          setReportAId(actualReports[1]?.id ?? actualReports[0]?.id ?? '');
+          setReportBId(actualReports[0]?.id ?? '');
+        } else {
+          const data = await fetchComparisonData();
+          if (active) setDatasets(data);
+        }
       } catch (err: unknown) {
-        setLoadError(
-          err instanceof Error ? err.message : 'Failed to load comparison data. Please try again.'
-        );
+        if (active) {
+          setLoadError(
+            err instanceof Error ? err.message : 'Failed to load comparison data. Please try again.'
+          );
+        }
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     }
-    loadData();
-  }, []);
+    void loadData();
+    return () => { active = false; };
+  }, [token]);
 
   const currentDataset = datasets ? datasets[selectedKey] : null;
+  const reportA = userReports.find((report) => report.id === reportAId) ?? null;
+  const reportB = userReports.find((report) => report.id === reportBId) ?? null;
+  const userMetrics = reportA && reportB
+    ? reportA.test_results.flatMap((firstResult) => {
+        const secondResult = reportB.test_results.find(
+          (result) =>
+            normalize(result.test_name) === normalize(firstResult.test_name) &&
+            normalize(result.unit) === normalize(firstResult.unit),
+        );
+        if (!secondResult) return [];
+        const firstValue = numericValue(firstResult.value);
+        const secondValue = numericValue(secondResult.value);
+        if (firstValue === null || secondValue === null) return [];
+        const difference = secondValue - firstValue;
+        return [{
+          name: firstResult.test_name,
+          first: firstValue,
+          second: secondValue,
+          unit: firstResult.unit,
+          diff: difference,
+          percent: firstValue === 0 ? null : (difference / Math.abs(firstValue)) * 100,
+        }];
+      })
+    : [];
+  const userChartData = userMetrics.map((metric) => ({
+    name: metric.name,
+    earlierResult: metric.first,
+    laterResult: metric.second,
+    unit: metric.unit,
+  }));
+
+  if (token) {
+    return (
+      <div className="space-y-6 animate-fadeIn">
+        <header className="border-b border-slate-200 pb-4">
+          <div className="flex items-center gap-2"><GitCompare className="h-6 w-6 text-indigo-600" /><h1 className="text-2xl font-extrabold text-slate-900">{language === 'te' ? 'మీ రిపోర్టుల పోలిక' : language === 'hi' ? 'अपनी रिपोर्ट की तुलना करें' : 'Compare Your Reports'}</h1></div>
+          <p className="mt-1 text-sm text-slate-600">{language === 'te' ? 'పేర్లు మరియు యూనిట్లు సరిపోలే సంఖ్యా పరీక్షలను మాత్రమే పోలుస్తుంది.' : language === 'hi' ? 'केवल समान नाम और इकाइयों वाले संख्यात्मक परीक्षणों की तुलना की जाती है।' : 'Only numeric tests with matching names and units are compared. No clinical conclusion is inferred.'}</p>
+        </header>
+        {loading && <p role="status" className="text-sm text-slate-500">{language === 'hi' ? 'रिपोर्ट लोड हो रही हैं…' : 'Loading your reports…'}</p>}
+        {loadError && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{loadError}</p>}
+        {!loading && userReports.length < 2 && <p className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-600">{language === 'te' ? 'పోల్చడానికి కనీసం రెండు అప్‌లోడ్ చేసిన రిపోర్టులను విశ్లేషించి సేవ్ చేయండి.' : language === 'hi' ? 'तुलना करने के लिए कम से कम दो अपलोड की गई रिपोर्ट का विश्लेषण और सहेजें।' : 'Analyze and save at least two uploaded reports to compare your results.'}</p>}
+        {userReports.length >= 2 && (
+          <>
+            <div className="grid gap-4 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-2">
+              <label className="text-sm font-semibold text-slate-700">{language === 'hi' ? 'पहली रिपोर्ट' : 'Earlier report'}
+                <select value={reportAId} onChange={(event) => setReportAId(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 p-2 text-sm font-normal">
+                  {userReports.map((report) => <option key={report.id} value={report.id}>{report.filename} · {new Date(report.analyzed_at).toLocaleDateString()}</option>)}
+                </select>
+              </label>
+              <label className="text-sm font-semibold text-slate-700">{language === 'hi' ? 'दूसरी रिपोर्ट' : 'Later report'}
+                <select value={reportBId} onChange={(event) => setReportBId(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 p-2 text-sm font-normal">
+                  {userReports.map((report) => <option key={report.id} value={report.id}>{report.filename} · {new Date(report.analyzed_at).toLocaleDateString()}</option>)}
+                </select>
+              </label>
+            </div>
+            {reportAId === reportBId ? <p role="alert" className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">{language === 'hi' ? 'तुलना के लिए दो अलग-अलग रिपोर्ट चुनें।' : 'Choose two different reports to compare.'}</p> : userMetrics.length === 0 ? <p className="rounded-xl border border-dashed border-slate-300 p-5 text-sm text-slate-600">{language === 'hi' ? 'दोनों रिपोर्ट में समान नाम और इकाइयों वाले संख्यात्मक परिणाम नहीं मिले।' : 'No compatible numeric tests with matching names and units were found in both reports.'}</p> : (
+              <>
+                <div className="h-72 rounded-2xl border border-slate-200 bg-white p-4">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={userChartData}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="name" /><YAxis /><Tooltip /><Legend /><Bar dataKey="earlierResult" name={reportA?.filename ?? 'Earlier report'} fill="#6366f1" /><Bar dataKey="laterResult" name={reportB?.filename ?? 'Later report'} fill="#10b981" /></BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
+                  <table className="w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-600"><tr><th className="p-3">Test</th><th className="p-3">{reportA?.filename}</th><th className="p-3">{reportB?.filename}</th><th className="p-3">{language === 'hi' ? 'परिवर्तन' : 'Change'}</th></tr></thead>
+                    <tbody>{userMetrics.map((metric) => <tr key={`${metric.name}-${metric.unit}`} className="border-t border-slate-100"><td className="p-3 font-semibold">{metric.name} <span className="font-normal text-slate-500">({metric.unit})</span></td><td className="p-3">{metric.first}</td><td className="p-3">{metric.second}</td><td className="p-3">{metric.diff > 0 ? '+' : ''}{metric.diff.toFixed(2)} {metric.unit}{metric.percent === null ? '' : ` (${metric.percent > 0 ? '+' : ''}${metric.percent.toFixed(1)}%)`}</td></tr>)}</tbody>
+                  </table>
+                </div>
+                <p className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{language === 'te' ? 'మార్పులు స్వయంగా రోగ నిర్ధారణ కాదు. ఫలితాలను వైద్య నిపుణుడితో చర్చించండి.' : language === 'hi' ? 'परिवर्तन अपने आप में निदान नहीं हैं। परिणामों पर स्वास्थ्य पेशेवर से चर्चा करें।' : 'Changes alone are not a diagnosis. Discuss these results with a qualified healthcare professional.'}</p>
+              </>
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
 
   // Prepare chart data format for Recharts
   const chartData = currentDataset

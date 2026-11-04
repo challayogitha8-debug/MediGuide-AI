@@ -19,9 +19,9 @@ from typing import Iterator, Literal, Optional
 
 import jwt
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger("MediGuide.auth")
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -74,7 +74,9 @@ def initialize_database() -> None:
                 name TEXT NOT NULL,
                 password_hash TEXT,
                 role TEXT NOT NULL CHECK (role IN ('doctor', 'patient')),
-                avatar TEXT
+                avatar TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                login_method TEXT NOT NULL DEFAULT 'password'
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -92,8 +94,53 @@ def initialize_database() -> None:
                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 expires_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS report_history (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                report_type TEXT NOT NULL,
+                analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                summary_json TEXT NOT NULL,
+                test_results_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS report_history_user_idx
+                ON report_history(user_id, analyzed_at DESC);
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                question TEXT NOT NULL,
+                reply TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS chat_history_user_idx
+                ON chat_history(user_id, created_at DESC);
             """
         )
+        user_columns = {
+            column["name"] for column in connection.execute("PRAGMA table_info(users)")
+        }
+        if "created_at" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+            connection.execute(
+                "UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at = ''"
+            )
+        if "login_method" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN login_method TEXT NOT NULL DEFAULT 'password'"
+            )
+        report_columns = {
+            column["name"] for column in connection.execute("PRAGMA table_info(report_history)")
+        }
+        if "pdf_path" not in report_columns:
+            connection.execute("ALTER TABLE report_history ADD COLUMN pdf_path TEXT NOT NULL DEFAULT ''")
+        if "patient_info_json" not in report_columns:
+            connection.execute("ALTER TABLE report_history ADD COLUMN patient_info_json TEXT NOT NULL DEFAULT '{}'")
+        if "status" not in report_columns:
+            connection.execute("ALTER TABLE report_history ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
+        if "file_size" not in report_columns:
+            connection.execute("ALTER TABLE report_history ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0")
+        if "abnormal_count" not in report_columns:
+            connection.execute("ALTER TABLE report_history ADD COLUMN abnormal_count INTEGER NOT NULL DEFAULT 0")
 
 
 initialize_database()
@@ -145,6 +192,8 @@ def profile(user: sqlite3.Row) -> "UserProfile":
         name=user["name"],
         avatar=user["avatar"],
         role=user["role"],
+        created_at=user["created_at"],
+        login_method=user["login_method"],
     )
 
 
@@ -162,7 +211,7 @@ def issue_session(user_id: str, remember_me: bool) -> str:
 def get_user_by_email(email: str) -> Optional[sqlite3.Row]:
     with db_session() as connection:
         return connection.execute(
-            "SELECT id, email, name, password_hash, role, avatar FROM users WHERE email = ? COLLATE NOCASE",
+            "SELECT id, email, name, password_hash, role, avatar, created_at, login_method FROM users WHERE email = ? COLLATE NOCASE",
             (email,),
         ).fetchone()
 
@@ -170,7 +219,7 @@ def get_user_by_email(email: str) -> Optional[sqlite3.Row]:
 def get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with db_session() as connection:
         return connection.execute(
-            "SELECT id, email, name, password_hash, role, avatar FROM users WHERE id = ?",
+            "SELECT id, email, name, password_hash, role, avatar, created_at, login_method FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
 
@@ -187,7 +236,8 @@ def get_current_user(
     with db_session() as connection:
         user = connection.execute(
             """
-            SELECT users.id, users.email, users.name, users.password_hash, users.role, users.avatar
+            SELECT users.id, users.email, users.name, users.password_hash, users.role, users.avatar,
+                   users.created_at, users.login_method
             FROM sessions JOIN users ON users.id = sessions.user_id
             WHERE sessions.token_hash = ? AND sessions.expires_at > ?
             """,
@@ -208,6 +258,46 @@ class UserProfile(BaseModel):
     name: str
     avatar: Optional[str] = None
     role: Role
+    created_at: str
+    login_method: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    avatar: Optional[str] = Field(default=None, max_length=2048)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 2:
+            raise ValueError("Please enter your full name.")
+        return normalized
+
+    @field_validator("avatar")
+    @classmethod
+    def validate_avatar(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        parsed = urllib.parse.urlparse(value.strip())
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("Profile picture must be an HTTPS image URL.")
+        return value.strip()
+
+
+class ReportHistoryRequest(BaseModel):
+    id: Optional[str] = None
+    filename: str = Field(min_length=1, max_length=255)
+    report_type: str = Field(min_length=1, max_length=120)
+    summary: dict[str, object]
+    test_results: list[dict[str, object]] = Field(default_factory=list, max_length=100)
+    patient_info: Optional[dict[str, object]] = None
+    file_size: Optional[int] = 0
+
+
+class ChatHistoryRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    reply: str = Field(min_length=1, max_length=12000)
 
 
 class AuthResponse(BaseModel):
@@ -319,6 +409,10 @@ async def login(request: LoginRequest) -> AuthResponse:
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"This account is not registered for {request.expected_role.capitalize()} Login.",
         )
+    with db_session() as connection:
+        connection.execute("UPDATE users SET login_method = 'password' WHERE id = ?", (user["id"],))
+    user = get_user_by_id(user["id"])
+    assert user is not None
     return AuthResponse(
         success=True,
         token=issue_session(user["id"], request.remember_me),
@@ -377,6 +471,21 @@ async def current_session(user: sqlite3.Row = Depends(get_current_user)) -> User
     return profile(user)
 
 
+@router.patch("/me", response_model=UserProfile)
+async def update_current_profile(
+    request: ProfileUpdateRequest,
+    user: sqlite3.Row = Depends(get_current_user),
+) -> UserProfile:
+    with db_session() as connection:
+        connection.execute(
+            "UPDATE users SET name = ?, avatar = ? WHERE id = ?",
+            (request.name, request.avatar, user["id"]),
+        )
+    updated_user = get_user_by_id(user["id"])
+    assert updated_user is not None
+    return profile(updated_user)
+
+
 @router.post("/logout")
 async def logout(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
@@ -388,6 +497,165 @@ async def logout(
                 (digest_token(credentials.credentials),),
             )
     return {"success": True}
+
+
+@router.get("/history")
+async def get_history(user: sqlite3.Row = Depends(get_current_user)) -> dict[str, list[dict]]:
+    with db_session() as connection:
+        reports = connection.execute(
+            """
+            SELECT id, filename, report_type, analyzed_at, summary_json, test_results_json,
+                   pdf_path, patient_info_json, status, file_size, abnormal_count
+            FROM report_history WHERE user_id = ? ORDER BY analyzed_at DESC
+            """,
+            (user["id"],),
+        ).fetchall()
+        chats = connection.execute(
+            """
+            SELECT id, question, reply, created_at
+            FROM chat_history WHERE user_id = ? ORDER BY created_at DESC
+            """,
+            (user["id"],),
+        ).fetchall()
+    return {
+        "reports": [
+            {
+                "id": report["id"],
+                "filename": report["filename"],
+                "report_type": report["report_type"],
+                "analyzed_at": report["analyzed_at"],
+                "summary": json.loads(report["summary_json"]),
+                "test_results": json.loads(report["test_results_json"]),
+                "patient_info": json.loads(report["patient_info_json"] or "{}"),
+                "status": report["status"] or "completed",
+                "file_size": report["file_size"] or 0,
+                "abnormal_count": report["abnormal_count"] or 0,
+                "has_pdf": bool(report["pdf_path"] and os.path.exists(report["pdf_path"])),
+            }
+            for report in reports
+        ],
+        "chats": [dict(chat) for chat in chats],
+    }
+
+
+@router.post("/history/reports", status_code=status.HTTP_201_CREATED)
+async def save_report_history(
+    request: ReportHistoryRequest,
+    user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, str]:
+    report_id = request.id or f"report_{uuid.uuid4().hex}"
+    
+    abnormal_count = 0
+    for item in request.test_results:
+        st = str(item.get("status", "")).lower()
+        if st and st != "normal":
+            abnormal_count += 1
+
+    with db_session() as connection:
+        existing = connection.execute(
+            "SELECT id FROM report_history WHERE id = ? AND user_id = ?",
+            (report_id, user["id"]),
+        ).fetchone()
+        if existing:
+            return {"id": existing["id"]}
+
+        connection.execute(
+            """
+            INSERT INTO report_history(
+                id, user_id, filename, report_type, summary_json, test_results_json,
+                patient_info_json, abnormal_count, file_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report_id,
+                user["id"],
+                request.filename,
+                request.report_type,
+                json.dumps(request.summary, ensure_ascii=False),
+                json.dumps(request.test_results, ensure_ascii=False),
+                json.dumps(request.patient_info or {}, ensure_ascii=False),
+                abnormal_count,
+                request.file_size or 0,
+            ),
+        )
+    return {"id": report_id}
+
+
+@router.get("/history/reports/{report_id}/download")
+async def download_report_pdf(
+    report_id: str,
+    user: sqlite3.Row = Depends(get_current_user),
+):
+    with db_session() as connection:
+        report = connection.execute(
+            """
+            SELECT id, filename, report_type, analyzed_at, summary_json, test_results_json,
+                   patient_info_json, pdf_path
+            FROM report_history WHERE id = ? AND user_id = ?
+            """,
+            (report_id, user["id"]),
+        ).fetchone()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found or access denied.")
+    
+    pdf_path = report["pdf_path"]
+    if pdf_path and os.path.exists(pdf_path):
+        safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', report["filename"])
+        if not safe_filename.lower().endswith(".pdf"):
+            safe_filename += ".pdf"
+        return FileResponse(
+            path=pdf_path,
+            filename=safe_filename,
+            media_type="application/pdf",
+        )
+    
+    generated_pdf = generate_report_pdf(report)
+    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', report["filename"])
+    if not safe_filename.lower().endswith(".pdf"):
+        safe_filename += ".pdf"
+    return Response(
+        content=generated_pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
+
+
+@router.post("/history/chats", status_code=status.HTTP_201_CREATED)
+async def save_chat_history(
+    request: ChatHistoryRequest,
+    user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, str]:
+    chat_id = f"chat_{uuid.uuid4().hex}"
+    with db_session() as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_history(id, user_id, question, reply)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, user["id"], request.question, request.reply),
+        )
+    return {"id": chat_id}
+
+
+@router.delete("/history/{record_type}/{record_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_history_record(
+    record_type: str,
+    record_id: str,
+    user: sqlite3.Row = Depends(get_current_user),
+) -> None:
+    if record_type == "reports":
+        table_name = "report_history"
+    elif record_type == "chats":
+        table_name = "chat_history"
+    else:
+        raise HTTPException(status_code=404, detail="History record was not found.")
+    with db_session() as connection:
+        result = connection.execute(
+            f"DELETE FROM {table_name} WHERE id = ? AND user_id = ?",
+            (record_id, user["id"]),
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="History record was not found.")
 
 
 def smtp_settings() -> tuple[str, int, str, str, str, bool]:
@@ -539,14 +807,31 @@ def verify_google_id_token(id_token: str, client_id: str) -> dict:
     return claims
 
 
-def create_oauth_user(email: str, name: str, avatar: Optional[str] = None) -> sqlite3.Row:
+def create_oauth_user(
+    email: str,
+    name: str,
+    avatar: Optional[str] = None,
+    update_profile: bool = False,
+) -> sqlite3.Row:
     user = get_user_by_email(email)
     if user:
+        if update_profile:
+            with db_session() as connection:
+                connection.execute(
+                    """
+                    UPDATE users
+                    SET name = ?, avatar = COALESCE(?, avatar), login_method = 'google'
+                    WHERE id = ?
+                    """,
+                    (name[:100] or "Google User", avatar, user["id"]),
+                )
+            user = get_user_by_id(user["id"])
+            assert user is not None
         return user
     user_id = f"usr_{uuid.uuid4().hex}"
     with db_session() as connection:
         connection.execute(
-            "INSERT INTO users(id, email, name, password_hash, role, avatar) VALUES (?, ?, ?, NULL, 'patient', ?)",
+            "INSERT INTO users(id, email, name, password_hash, role, avatar, login_method) VALUES (?, ?, ?, NULL, 'patient', ?, 'google')",
             (user_id, email, name[:100] or "MediGuide User", avatar),
         )
     user = get_user_by_id(user_id)
@@ -592,6 +877,7 @@ async def google_auth_url(state: str = Query(min_length=32, max_length=256)) -> 
         "redirect_uri": google_redirect_uri(),
         "response_type": "code",
         "scope": "openid email profile",
+        "prompt": "select_account",
         "state": state,
     }
     return OAuthUrlResponse(
@@ -644,7 +930,12 @@ async def google_auth_callback(request: GoogleOAuthRequest) -> AuthResponse:
         raise HTTPException(status_code=401, detail="Google authentication could not be verified.") from error
     email = normalize_email(claims["email"])
     try:
-        user = create_oauth_user(email, str(claims.get("name") or "Google User"), claims.get("picture"))
+        user = create_oauth_user(
+            email,
+            str(claims.get("name") or "Google User"),
+            claims.get("picture"),
+            update_profile=True,
+        )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Unable to create the account.") from None
     if request.expected_role and user["role"] != request.expected_role:
@@ -833,7 +1124,7 @@ async def apple_handoff_exchange(request: AppleHandoffRequest) -> AuthResponse:
             (digest_token(request.ticket),),
         )
         user = connection.execute(
-            "SELECT id, email, name, password_hash, role, avatar FROM users WHERE id = ?",
+            "SELECT id, email, name, password_hash, role, avatar, created_at, login_method FROM users WHERE id = ?",
             (handoff["user_id"],),
         ).fetchone()
         if not user:
@@ -849,3 +1140,112 @@ async def apple_handoff_exchange(request: AppleHandoffRequest) -> AuthResponse:
         user=profile(user),
         message=f"Signed in successfully with Apple as {user['name']}.",
     )
+
+
+def get_user_from_raw_token(token: str) -> Optional[sqlite3.Row]:
+    if not token or not token.strip():
+        return None
+    cleaned = token.strip()
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    try:
+        with db_session() as connection:
+            return connection.execute(
+                """
+                SELECT users.id, users.email, users.name, users.password_hash, users.role, users.avatar,
+                       users.created_at, users.login_method
+                FROM sessions JOIN users ON users.id = sessions.user_id
+                WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+                """,
+                (digest_token(cleaned), int(time.time())),
+            ).fetchone()
+    except Exception:
+        return None
+
+
+def generate_report_pdf(report: sqlite3.Row) -> bytes:
+    import io
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Heading1"],
+        fontSize=16,
+        leading=20,
+        textColor=colors.HexColor("#1E3A8A"),
+        spaceAfter=4,
+    )
+    normal_style = ParagraphStyle(
+        "ReportNormal",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#334155"),
+    )
+    bold_style = ParagraphStyle(
+        "ReportBold",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=12,
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#1E293B"),
+    )
+
+    elements = []
+    elements.append(Paragraph(f"MediGuide AI &mdash; Official Clinical Laboratory Record", title_style))
+    elements.append(Paragraph(f"<b>Report File:</b> {report['filename']} &nbsp;|&nbsp; <b>Category:</b> {report['report_type']} &nbsp;|&nbsp; <b>Analyzed:</b> {report['analyzed_at']}", normal_style))
+    elements.append(Spacer(1, 10))
+
+    summary = json.loads(report["summary_json"] or "{}")
+    test_results = json.loads(report["test_results_json"] or "[]")
+    
+    if summary.get("overview_en"):
+        elements.append(Paragraph("<b>Clinical Overview:</b>", bold_style))
+        elements.append(Paragraph(summary["overview_en"], normal_style))
+        elements.append(Spacer(1, 10))
+
+    if test_results:
+        table_data = [
+            [
+                Paragraph("<b>Test Parameter</b>", bold_style),
+                Paragraph("<b>Observed Value</b>", bold_style),
+                Paragraph("<b>Unit</b>", bold_style),
+                Paragraph("<b>Reference Range</b>", bold_style),
+                Paragraph("<b>Status</b>", bold_style),
+            ]
+        ]
+        for t in test_results:
+            status_text = str(t.get("status", "normal")).upper()
+            status_color = colors.HexColor("#15803D") if status_text == "NORMAL" else colors.HexColor("#B91C1C")
+            p_status = Paragraph(f"<font color='{status_color}'><b>{status_text}</b></font>", normal_style)
+            table_data.append([
+                Paragraph(str(t.get("test_name", "")), normal_style),
+                Paragraph(str(t.get("value", "")), bold_style),
+                Paragraph(str(t.get("unit", "")), normal_style),
+                Paragraph(str(t.get("reference_range", "N/A")), normal_style),
+                p_status,
+            ])
+        t_style = TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F1F5F9")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ])
+        table = Table(table_data, colWidths=[180, 80, 70, 120, 80])
+        table.setStyle(t_style)
+        elements.append(table)
+        elements.append(Spacer(1, 10))
+
+    elements.append(Paragraph("<font size='8' color='#64748B'>Educational summary generated by MediGuide AI. For personal medical evaluation, consult a licensed healthcare professional.</font>", normal_style))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()

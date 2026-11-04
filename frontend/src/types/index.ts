@@ -1,4 +1,4 @@
-export type Language = 'en' | 'te';
+export type Language = 'en' | 'te' | 'hi';
 
 export type NavigationTab = 
   | 'dashboard'
@@ -7,6 +7,10 @@ export type NavigationTab =
   | 'comparison'
   | 'sources'
   | 'settings'
+  | 'healthTips'
+  | 'emergency'
+  | 'history'
+  | 'account'
   | 'login';
 
 export interface UserProfile {
@@ -15,6 +19,8 @@ export interface UserProfile {
   name: string;
   avatar?: string | null;
   role: 'doctor' | 'patient';
+  created_at: string;
+  login_method: string;
 }
 
 export interface AuthResponse {
@@ -45,16 +51,12 @@ export interface LoginParams {
   email: string;
   password: string;
   remember_me?: boolean;
-  expected_role?: 'doctor' | 'patient' | null;
 }
 
 export interface SignupParams {
   name: string;
   email: string;
   password: string;
-  role?: 'doctor' | 'patient';
-  medical_license?: string;
-  doctor_invite_code?: string;
 }
 
 export interface PatientInfo {
@@ -74,15 +76,19 @@ export interface TestResultItem {
   status: TestStatus;
   description: string;
   description_te?: string;
+  description_hi?: string;
 }
 
 export interface ReportSummary {
   overview_en: string;
   overview_te: string;
+  overview_hi?: string;
   key_takeaways_en: string[];
   key_takeaways_te: string[];
+  key_takeaways_hi?: string[];
   questions_for_doctor_en: string[];
   questions_for_doctor_te: string[];
+  questions_for_doctor_hi?: string[];
   disclaimer: string;
 }
 
@@ -99,6 +105,22 @@ export interface AnalyzeReportResponse {
   summary: ReportSummary;
 }
 
+export interface ReportHistoryEntry {
+  id: string;
+  filename: string;
+  report_type: string;
+  analyzed_at: string;
+  summary: ReportSummary;
+  test_results: TestResultItem[];
+}
+
+export interface ChatHistoryEntry {
+  id: string;
+  question: string;
+  reply: string;
+  created_at: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -107,6 +129,8 @@ export interface ChatMessage {
   mode?: 'ai' | 'demo';
   suggested_questions?: string[];
   sources?: ChatSource[];
+  retryQuestion?: string;
+  failedUserMessageId?: string;
 }
 
 export interface ChatSource {
@@ -117,19 +141,31 @@ export interface ChatSource {
 }
 
 export interface ChatResponse {
-  mode: 'ai' | 'demo';
+  mode: 'ai';
   reply: string;
   language: Language;
   suggested_questions: string[];
   trusted_sources: ChatSource[];
   disclaimer: string;
+  provider: 'gemini' | 'secondary';
+  fallback_used: boolean;
+  cached: boolean;
+}
+
+export interface AIStatus {
+  status: 'available' | 'switching' | 'unavailable';
+  primary_configured: boolean;
+  secondary_configured: boolean;
+  active_provider: 'gemini' | 'secondary' | null;
 }
 
 export interface HealthStatus {
   status: string;
   gemini_configured: boolean;
-  gemini_status?: 'connected' | 'missing_key' | 'invalid_key' | 'error';
+  gemini_status?: 'connected' | 'missing_key' | 'invalid_key' | 'permission_denied' | 'rate_limited' | 'invalid_request' | 'timeout' | 'unavailable' | 'error';
   gemini_message?: string;
+  secondary_ai_configured?: boolean;
+  ai_available?: boolean;
   model: string;
   version: string;
   features: string[];
