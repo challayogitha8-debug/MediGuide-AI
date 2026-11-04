@@ -29,6 +29,7 @@ import pypdf
 from backend.ai_service import (
     AIService,
     GeneratedAnswer,
+    GroqProvider,
     build_medical_system_prompt,
     provider_retry_delay,
 )
@@ -59,7 +60,7 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
 else:
     logger.info("No active GEMINI_API_KEY found. Gemini provider is not configured.")
 
-AI_SERVICE = AIService(lambda: gemini_client)
+AI_SERVICE = AIService(lambda: gemini_client, groq_provider=GroqProvider())
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -104,6 +105,7 @@ class HealthResponse(BaseModel):
     gemini_configured: bool
     gemini_status: Optional[str] = "missing_key"
     gemini_message: Optional[str] = None
+    groq_ai_configured: bool = False
     secondary_ai_configured: bool = False
     ai_available: bool = False
     model: str
@@ -760,6 +762,7 @@ async def health_check(check: bool = False):
         gemini_configured=is_connected,
         gemini_status=gemini_status,
         gemini_message=gemini_msg,
+        groq_ai_configured=AI_SERVICE.groq.configured,
         secondary_ai_configured=AI_SERVICE.secondary.configured,
         ai_available=AI_SERVICE.status_snapshot()["status"] != "unavailable",
         model=(

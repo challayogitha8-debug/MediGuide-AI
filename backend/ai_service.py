@@ -144,14 +144,18 @@ class GeminiProvider:
 
 
 class OpenAIProvider:
-    """Uses the official OpenAI SDK for the configured secondary provider."""
+    """Uses the official OpenAI SDK for an OpenAI-compatible provider."""
 
     name = "secondary"
+    api_key_environment = "OPENAI_API_KEY"
+    model_environment = "OPENAI_MODEL"
+    timeout_environment = "OPENAI_TIMEOUT_SECONDS"
+    base_url: Optional[str] = None
 
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
-        self.timeout = _int_setting("OPENAI_TIMEOUT_SECONDS", 30, minimum=1, maximum=120)
+        self.api_key = os.getenv(self.api_key_environment, "").strip()
+        self.model = os.getenv(self.model_environment, "").strip()
+        self.timeout = _int_setting(self.timeout_environment, 30, minimum=1, maximum=120)
         self._client: Any = None
 
     @property
@@ -166,11 +170,14 @@ class OpenAIProvider:
             try:
                 from openai import OpenAI
 
-                self._client = OpenAI(
-                    api_key=self.api_key,
-                    timeout=self.timeout,
-                    max_retries=0,
-                )
+                client_options: dict[str, Any] = {
+                    "api_key": self.api_key,
+                    "timeout": self.timeout,
+                    "max_retries": 0,
+                }
+                if self.base_url:
+                    client_options["base_url"] = self.base_url
+                self._client = OpenAI(**client_options)
             except ImportError as error:
                 raise ProviderFailure(self.name, "unavailable") from error
             except Exception as error:
@@ -216,6 +223,16 @@ class OpenAIProvider:
                 headers = getattr(response, "headers", None)
                 retry_after = provider_retry_delay(error, attempt, headers)
                 retry_after = _quota_cooldown(error, retry_after)
+                if self.name == "groq":
+                    error_type, error_code, error_param = _safe_provider_error_fields(error)
+                    logger.warning(
+                        "Groq API error details (http_status=%s, error_type=%s, "
+                        "error_code=%s, error_param=%s).",
+                        code or "unavailable",
+                        error_type,
+                        error_code,
+                        error_param,
+                    )
                 failure = ProviderFailure(
                     self.name,
                     _error_category(code, error),
@@ -236,22 +253,40 @@ class OpenAIProvider:
         raise ProviderFailure(self.name, "rate_limit", 429)
 
 
+class GroqProvider(OpenAIProvider):
+    """Uses Groq's OpenAI-compatible chat completions API."""
+
+    name = "groq"
+    api_key_environment = "GROQ_API_KEY"
+    model_environment = "GROQ_MODEL"
+    timeout_environment = "GROQ_TIMEOUT_SECONDS"
+    base_url = "https://api.groq.com/openai/v1"
+
+
 class AIService:
     def __init__(
         self,
         gemini_client_getter: Callable[[], Any],
         secondary_provider: Optional[ChatProvider] = None,
+        groq_provider: Optional[ChatProvider] = None,
     ):
         self.primary = GeminiProvider(gemini_client_getter)
         self.secondary = secondary_provider or OpenAIProvider()
+        self.groq = groq_provider or GroqProvider()
+        self.providers = [self.groq, self.primary, self.secondary]
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float, GeneratedAnswer]] = {}
         self._inflight: dict[str, Future[GeneratedAnswer]] = {}
         self._cooldowns: dict[str, float] = {}
-        self._provider_states = {"gemini": "unknown", "secondary": "unknown"}
+        self._provider_states = {
+            provider.name: "unknown"
+            for provider in self.providers
+        }
         self._switching = 0
         self._last_provider: Optional[str] = None
-        self._last_status = "available" if self.primary.configured or self.secondary.configured else "unavailable"
+        self._last_status = "available" if any(
+            provider.configured for provider in self.providers
+        ) else "unavailable"
         self._request_times: dict[str, deque[float]] = defaultdict(deque)
         self._metrics: dict[str, dict[str, float | int]] = defaultdict(_empty_metrics)
 
@@ -309,7 +344,7 @@ class AIService:
         history: list[dict[str, str]],
         message: str,
     ) -> GeneratedAnswer:
-        providers = [self.primary, self.secondary]
+        providers = self.providers
         failures: list[ProviderFailure] = []
         for index, provider in enumerate(providers):
             if not provider.configured:
@@ -331,13 +366,13 @@ class AIService:
                     self._switching += 1
                     self._last_status = "switching"
                     self._metrics["service"]["provider_switches"] += 1
-                    primary_failure = failures[0] if failures else None
+                    prior_failure = failures[-1] if failures else None
                     logger.info(
                         "AI provider fallback attempted (from=%s, to=%s, reason=%s, http_status=%s).",
-                        self.primary.name,
+                        prior_failure.provider if prior_failure else providers[index - 1].name,
                         provider.name,
-                        primary_failure.category if primary_failure else "not_configured",
-                        primary_failure.status_code if primary_failure and primary_failure.status_code else "unavailable",
+                        prior_failure.category if prior_failure else "not_configured",
+                        prior_failure.status_code if prior_failure and prior_failure.status_code else "unavailable",
                     )
 
             started = time.monotonic()
@@ -386,8 +421,6 @@ class AIService:
                     failure.status_code or "unavailable",
                     duration,
                 )
-                if index == 0 and self.secondary.configured:
-                    continue
                 if index > 0:
                     with self._lock:
                         self._last_status = "unavailable"
@@ -443,16 +476,16 @@ class AIService:
 
     def status_snapshot(self) -> dict[str, Any]:
         now = time.time()
-        primary_configured = self.primary.configured
-        secondary_configured = self.secondary.configured
+        configured_by_provider = {
+            provider.name: provider.configured
+            for provider in self.providers
+        }
         with self._lock:
             active = [
-                name
-                for name, configured in (
-                    ("gemini", primary_configured),
-                    ("secondary", secondary_configured),
-                )
-                if configured and self._cooldowns.get(name, 0.0) <= now
+                provider.name
+                for provider in self.providers
+                if configured_by_provider[provider.name]
+                and self._cooldowns.get(provider.name, 0.0) <= now
             ]
             status_value = (
                 "switching"
@@ -465,9 +498,26 @@ class AIService:
             )
             return {
                 "status": status_value,
-                "primary_configured": primary_configured,
-                "secondary_configured": secondary_configured,
+                "primary_configured": configured_by_provider.get("groq", False),
+                "groq_configured": configured_by_provider.get("groq", False),
+                "gemini_configured": configured_by_provider.get("gemini", False),
+                "secondary_configured": configured_by_provider.get("secondary", False),
                 "active_provider": self._last_provider if status_value == "available" else None,
+                "providers": {
+                    provider.name: {
+                        "configured": configured_by_provider[provider.name],
+                        "status": (
+                            self._provider_states.get(provider.name, "unknown")
+                            if configured_by_provider[provider.name]
+                            else "not_configured"
+                        ),
+                        "cooldown_seconds": max(
+                            0,
+                            math.ceil(self._cooldowns.get(provider.name, 0.0) - now),
+                        ),
+                    }
+                    for provider in self.providers
+                },
             }
 
     def update_provider_health(
@@ -503,25 +553,27 @@ class AIService:
 
     def metrics_snapshot(self) -> dict[str, Any]:
         with self._lock:
-            for name in ("service", "gemini", "secondary"):
+            provider_names = [provider.name for provider in self.providers]
+            for name in ("service", *provider_names):
                 self._metrics[name]
             result = {
                 name: dict(values)
                 for name, values in self._metrics.items()
             }
             result["providers_configured"] = {
-                "gemini": self.primary.configured,
-                "secondary": self.secondary.configured,
+                provider.name: provider.configured
+                for provider in self.providers
             }
             result["pricing_configured"] = {
-                "gemini": (
-                    _optional_float_setting("AI_GEMINI_INPUT_USD_PER_1M") is not None
-                    and _optional_float_setting("AI_GEMINI_OUTPUT_USD_PER_1M") is not None
-                ),
-                "secondary": (
-                    _optional_float_setting("AI_SECONDARY_INPUT_USD_PER_1M") is not None
-                    and _optional_float_setting("AI_SECONDARY_OUTPUT_USD_PER_1M") is not None
-                ),
+                provider: (
+                    _optional_float_setting(f"{prefix}_INPUT_USD_PER_1M") is not None
+                    and _optional_float_setting(f"{prefix}_OUTPUT_USD_PER_1M") is not None
+                )
+                for provider, prefix in (
+                    ("groq", "AI_GROQ"),
+                    ("gemini", "AI_GEMINI"),
+                    ("secondary", "AI_SECONDARY"),
+                )
             }
             result["cooldowns"] = {
                 name: max(0, math.ceil(until - time.time()))
@@ -535,7 +587,13 @@ class AIService:
             return
         metrics["input_tokens"] += result.input_tokens
         metrics["output_tokens"] += result.output_tokens
-        prefix = "AI_GEMINI" if provider == "gemini" else "AI_SECONDARY"
+        prefix = {
+            "groq": "AI_GROQ",
+            "gemini": "AI_GEMINI",
+            "secondary": "AI_SECONDARY",
+        }.get(provider)
+        if prefix is None:
+            return
         input_rate = _optional_float_setting(f"{prefix}_INPUT_USD_PER_1M")
         output_rate = _optional_float_setting(f"{prefix}_OUTPUT_USD_PER_1M")
         if input_rate is not None and output_rate is not None:
@@ -728,9 +786,9 @@ def _error_category(code: Optional[int], error: Exception) -> str:
         return "rate_limit"
     if code in (401, 403):
         return "authentication"
-    if code == 400:
+    if code in (400, 404):
         return "invalid_request"
-    if code == 404 or code in (500, 502, 503, 504):
+    if code in (500, 502, 503, 504):
         return "unavailable"
     if code in (408,):
         return "timeout"
@@ -739,6 +797,28 @@ def _error_category(code: Optional[int], error: Exception) -> str:
     if isinstance(error, (urllib.error.URLError, OSError)):
         return "network"
     return "provider_error"
+
+
+def _safe_provider_error_fields(error: Exception) -> tuple[str, str, str]:
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        response = getattr(error, "response", None)
+        try:
+            body = response.json() if response is not None else None
+        except Exception:
+            body = None
+    details = body.get("error", body) if isinstance(body, dict) else {}
+    if not isinstance(details, dict):
+        return "unknown", "unknown", "unknown"
+
+    def safe_field(name: str) -> str:
+        value = details.get(name)
+        if not isinstance(value, (str, int)):
+            return "unknown"
+        normalized = " ".join(str(value).split())
+        return normalized[:100] or "unknown"
+
+    return safe_field("type"), safe_field("code"), safe_field("param")
 
 
 def _int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
