@@ -147,7 +147,7 @@ export interface ChatResponse {
   suggested_questions: string[];
   trusted_sources: ChatSource[];
   disclaimer: string;
-  provider: 'gemini' | 'secondary';
+  provider: 'groq' | 'gemini' | 'secondary';
   fallback_used: boolean;
   cached: boolean;
 }
@@ -155,8 +155,16 @@ export interface ChatResponse {
 export interface AIStatus {
   status: 'available' | 'switching' | 'unavailable';
   primary_configured: boolean;
+  groq_configured?: boolean;
+  gemini_configured?: boolean;
   secondary_configured: boolean;
-  active_provider: 'gemini' | 'secondary' | null;
+  active_provider: 'groq' | 'gemini' | 'secondary' | null;
+  providers?: Partial<
+    Record<
+      'groq' | 'gemini' | 'secondary',
+      { configured: boolean; status: string; cooldown_seconds: number }
+    >
+  >;
 }
 
 export interface HealthStatus {
@@ -164,6 +172,7 @@ export interface HealthStatus {
   gemini_configured: boolean;
   gemini_status?: 'connected' | 'missing_key' | 'invalid_key' | 'permission_denied' | 'rate_limited' | 'invalid_request' | 'timeout' | 'unavailable' | 'error';
   gemini_message?: string;
+  groq_ai_configured?: boolean;
   secondary_ai_configured?: boolean;
   ai_available?: boolean;
   model: string;
