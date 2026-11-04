@@ -122,6 +122,7 @@ class GeminiProvider:
                 code = getattr(error, "code", None)
                 code = code if isinstance(code, int) else None
                 retry_after = provider_retry_delay(error, attempt)
+                retry_after = _quota_cooldown(error, retry_after)
                 category = _error_category(code, error)
                 if (
                     code == 429
@@ -214,6 +215,7 @@ class OpenAIProvider:
                 response = getattr(error, "response", None)
                 headers = getattr(response, "headers", None)
                 retry_after = provider_retry_delay(error, attempt, headers)
+                retry_after = _quota_cooldown(error, retry_after)
                 failure = ProviderFailure(
                     self.name,
                     _error_category(code, error),
@@ -315,14 +317,28 @@ class AIService:
             with self._lock:
                 cooldown_until = self._cooldowns.get(provider.name, 0.0)
                 if cooldown_until > time.time():
-                    failures.append(ProviderFailure(provider.name, "rate_limit", 429, cooldown_until - time.time()))
+                    remaining = cooldown_until - time.time()
+                    failures.append(ProviderFailure(provider.name, "rate_limit", 429, remaining))
+                    logger.warning(
+                        "AI provider skipped (provider=%s, category=rate_limit, "
+                        "http_status=429, cooldown_seconds=%.0f).",
+                        provider.name,
+                        remaining,
+                    )
                     continue
                 self._metrics[provider.name]["requests"] += 1
                 if index > 0:
                     self._switching += 1
                     self._last_status = "switching"
                     self._metrics["service"]["provider_switches"] += 1
-                    logger.info("Switching AI provider after primary provider failure.")
+                    primary_failure = failures[0] if failures else None
+                    logger.info(
+                        "AI provider fallback attempted (from=%s, to=%s, reason=%s, http_status=%s).",
+                        self.primary.name,
+                        provider.name,
+                        primary_failure.category if primary_failure else "not_configured",
+                        primary_failure.status_code if primary_failure and primary_failure.status_code else "unavailable",
+                    )
 
             started = time.monotonic()
             try:
@@ -338,7 +354,7 @@ class AIService:
                     self._last_status = "available"
                     self._provider_states[provider.name] = "connected"
                 logger.info(
-                    "AI provider request succeeded (provider=%s, fallback=%s, response_time_ms=%.0f).",
+                    "AI provider response (provider=%s, outcome=succeeded, fallback=%s, response_time_ms=%.0f).",
                     provider.name,
                     index > 0,
                     duration,
@@ -375,6 +391,13 @@ class AIService:
                 if index > 0:
                     with self._lock:
                         self._last_status = "unavailable"
+                    logger.warning(
+                        "AI provider fallback outcome (provider=%s, outcome=failed, "
+                        "category=%s, http_status=%s).",
+                        provider.name,
+                        failure.category,
+                        failure.status_code or "unavailable",
+                    )
                 if failure.category == "not_configured":
                     continue
             finally:
@@ -637,8 +660,19 @@ def _has_explicit_retry_hint(error: Any, headers: Any = None) -> bool:
 
 
 def _is_exhausted_quota(error: Any) -> bool:
-    quota_markers = ("insufficient_quota", "quota_exceeded", "daily_limit_exceeded")
-    pending = [getattr(error, "code", None), getattr(error, "details", None)]
+    quota_markers = (
+        "insufficient_quota",
+        "quota_exceeded",
+        "daily_limit_exceeded",
+        "quota exhausted",
+        "quota exceeded",
+        "exceeded your current quota",
+    )
+    pending = [
+        getattr(error, "code", None),
+        getattr(error, "details", None),
+        getattr(error, "body", None),
+    ]
     while pending:
         value = pending.pop()
         if isinstance(value, str):
@@ -649,6 +683,18 @@ def _is_exhausted_quota(error: Any) -> bool:
         elif isinstance(value, list):
             pending.extend(value)
     return False
+
+
+def _quota_cooldown(error: Any, retry_after: float) -> float:
+    if not _is_exhausted_quota(error):
+        return retry_after
+    configured_cooldown = _int_setting(
+        "AI_QUOTA_COOLDOWN_SECONDS",
+        300,
+        minimum=30,
+        maximum=86400,
+    )
+    return max(retry_after, float(configured_cooldown))
 
 
 def _duration_seconds(value: Any) -> Optional[float]:
